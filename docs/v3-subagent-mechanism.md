@@ -187,4 +187,4 @@ Same agent loop, different contexts. That's the whole trick.
 
 **Divide and conquer. Context isolation.**
 
-[← v2](./v2-structured-planning.md) | [Back to README](../README.md) | [v0 →](./v0-bash-is-all-you-need.md)
+[← v2](./v2-structured-planning.md) | [Back to README](../README.md) | [v4 →](./v4-skills-mechanism.md)
