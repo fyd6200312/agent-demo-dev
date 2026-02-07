@@ -56,6 +56,7 @@ Usage:
     python v2_todo_agent.py
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -75,6 +76,39 @@ WORKDIR = Path.cwd()
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
+
+
+def log_request(system: str, messages: list, tools: list):
+    """Log raw API request."""
+    if not DEBUG_LOG:
+        return
+    print("\n" + "=" * 80)
+    print("[REQUEST]")
+    print("=" * 80)
+    print(json.dumps({
+        "model": MODEL,
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+        "max_tokens": 8000,
+    }, ensure_ascii=False, indent=2, default=str))
+
+
+def log_response(response):
+    """Log raw API response."""
+    if not DEBUG_LOG:
+        return
+    print("\n" + "=" * 80)
+    print("[RESPONSE]")
+    print("=" * 80)
+    print(json.dumps(response.model_dump(), ensure_ascii=False, indent=2))
+    print("=" * 80 + "\n")
 
 
 # =============================================================================
@@ -329,7 +363,7 @@ def run_bash(cmd: str) -> str:
             capture_output=True, text=True, timeout=60
         )
         output = (result.stdout + result.stderr).strip()
-        return output[:50000] if output else "(no output)"
+        return output if output else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout"
     except Exception as e:
@@ -343,7 +377,7 @@ def run_read(path: str, limit: int = None) -> str:
         lines = text.splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(text.splitlines()) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -419,6 +453,8 @@ def agent_loop(messages: list) -> list:
     global rounds_without_todo
 
     while True:
+        log_request(SYSTEM, messages, TOOLS)
+
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -426,6 +462,8 @@ def agent_loop(messages: list) -> list:
             tools=TOOLS,
             max_tokens=8000,
         )
+
+        log_response(response)
 
         tool_calls = []
         for block in response.content:
@@ -444,8 +482,7 @@ def agent_loop(messages: list) -> list:
         for tc in tool_calls:
             print(f"\n> {tc.name}")
             output = execute_tool(tc.name, tc.input)
-            preview = output[:300] + "..." if len(output) > 300 else output
-            print(f"  {preview}")
+            print(f"  {output}")
 
             results.append({
                 "type": "tool_result",

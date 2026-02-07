@@ -1,126 +1,101 @@
 #!/usr/bin/env python3
 """
-v4_skills_agent.py - Mini Claude Code: Skills Mechanism (~550 lines)
+v5_sandbox_agent.py - Mini Claude Code: Permission Sandbox (~700 lines)
 
-Core Philosophy: "Knowledge Externalization"
-============================================
-v3 gave us subagents for task decomposition. But there's a deeper question:
+Core Philosophy: "Trust but Verify"
+===================================
+v4 gave us skills for domain knowledge. But there's a security question:
 
-    How does the model know HOW to handle domain-specific tasks?
+    How do we let the model be powerful WITHOUT being dangerous?
 
-- Processing PDFs? It needs to know pdftotext vs PyMuPDF
-- Building MCP servers? It needs protocol specs and best practices
-- Code review? It needs a systematic checklist
+v4's security is a joke:
+    if "rm -rf /" in cmd: return "Error"  # trivially bypassed
 
-This knowledge isn't a tool - it's EXPERTISE. Skills solve this by letting
-the model load domain knowledge on-demand.
+This is like a security guard who only checks for the word "bomb".
+Write "b0mb" and you're through.
 
-The Paradigm Shift: Knowledge Externalization
---------------------------------------------
-Traditional AI: Knowledge locked in model parameters
-  - To teach new skills: collect data -> train -> deploy
-  - Cost: $10K-$1M+, Timeline: Weeks
-  - Requires ML expertise, GPU clusters
+The Real Problem - Permission is a Spectrum:
+-------------------------------------------
+Binary security (allow/deny) doesn't match reality:
 
-Skills: Knowledge stored in editable files
-  - To teach new skills: write a SKILL.md file
-  - Cost: Free, Timeline: Minutes
-  - Anyone can do it
+    | Operation              | Should we...           |
+    |------------------------|------------------------|
+    | `ls -la`               | Always allow           |
+    | `cat file.py`          | Always allow           |
+    | `rm temp.txt`          | Ask user first         |
+    | `npm install pkg`      | Ask user first         |
+    | `rm -rf /`             | NEVER allow            |
+    | `curl | bash`          | NEVER allow            |
 
-It's like attaching a hot-swappable LoRA adapter without any training!
+Three levels, not two. This is how real systems work.
 
-Tools vs Skills:
----------------
-    | Concept   | What it is              | Example                    |
-    |-----------|-------------------------|---------------------------|
-    | **Tool**  | What model CAN do       | bash, read_file, write    |
-    | **Skill** | How model KNOWS to do   | PDF processing, MCP dev   |
+The Solution - Layered Permission Model:
+---------------------------------------
+    +------------------------------------------------------------------+
+    |                     Permission Flow                              |
+    +------------------------------------------------------------------+
+    |                                                                  |
+    |    Tool Call                                                     |
+    |        |                                                         |
+    |        v                                                         |
+    |    +------------------+                                          |
+    |    | PermissionCheck  |                                          |
+    |    +--------+---------+                                          |
+    |             |                                                    |
+    |    +--------+--------+--------+                                  |
+    |    |        |        |        |                                  |
+    |    v        v        v        v                                  |
+    | +------+ +------+ +------+ +------+                              |
+    | | READ | | WRITE| | EXEC | | NET  |                              |
+    | |ALLOW | | ASK  | | ASK  | | DENY |                              |
+    | +------+ +------+ +------+ +------+                              |
+    |                                                                  |
+    | Permission Levels:                                               |
+    |   ALLOW  - Execute without asking                                |
+    |   ASK    - Require user confirmation                             |
+    |   DENY   - Block completely                                      |
+    +------------------------------------------------------------------+
 
-Tools are capabilities. Skills are knowledge.
+Key Insight - Permission is UI:
+------------------------------
+Permission isn't just security - it's COMMUNICATION.
 
-Progressive Disclosure:
-----------------------
-    Layer 1: Metadata (always loaded)      ~100 tokens/skill
-             name + description only
+When the model asks "Can I run npm install?", it:
+1. Shows transparency (user sees what's happening)
+2. Builds trust (user is in control)
+3. Catches mistakes (user can say "wait, wrong project!")
 
-    Layer 2: SKILL.md body (on trigger)    ~2000 tokens
-             Detailed instructions
+This is why Claude Code asks before destructive operations.
 
-    Layer 3: Resources (as needed)         Unlimited
-             scripts/, references/, assets/
+Session Grants - "Allow for this session":
+-----------------------------------------
+Nobody wants to approve "git add" 50 times. Session grants remember:
 
-This keeps context lean while allowing arbitrary depth.
+    First time:  "Allow git add?"  -> User: "yes, always"
+    Next times:  (auto-approved)
 
-SKILL.md Standard:
------------------
-    skills/
-    |-- pdf/
-    |   |-- SKILL.md          # Required: YAML frontmatter + Markdown body
-    |-- mcp-builder/
-    |   |-- SKILL.md
-    |   |-- references/       # Optional: docs, specs
-    |-- code-review/
-        |-- SKILL.md
-        |-- scripts/          # Optional: helper scripts
-
-Cache-Preserving Injection:
---------------------------
-Critical insight: Skill content goes into tool_result (user message),
-NOT system prompt. This preserves prompt cache!
-
-    Wrong: Edit system prompt each time (cache invalidated, 20-50x cost)
-    Right: Append skill as tool result (prefix unchanged, cache hit)
-
-This is how production Claude Code works - and why it's cost-efficient.
+This balances security with usability.
 
 Usage:
-    python v4_skills_agent.py
+    python v5_sandbox_agent.py
 """
 
+import fnmatch
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-
-# =============================================================================
-# LangFuse Integration (optional, graceful degradation)
-# =============================================================================
-# Set env vars to enable: LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_HOST
-# When not configured, @observe becomes a no-op passthrough.
-
-try:
-    from langfuse.decorators import observe, langfuse_context
-    LANGFUSE_ENABLED = bool(
-        os.getenv("LANGFUSE_SECRET_KEY") and os.getenv("LANGFUSE_PUBLIC_KEY")
-    )
-    if not LANGFUSE_ENABLED:
-        raise ImportError("LangFuse keys not configured")
-except ImportError:
-    LANGFUSE_ENABLED = False
-
-    def observe(**kwargs):
-        """No-op decorator when langfuse is not available."""
-        def decorator(fn):
-            return fn
-        return decorator
-
-    class _FakeLangfuseContext:
-        def update_current_observation(self, **kwargs):
-            pass
-        def update_current_trace(self, **kwargs):
-            pass
-        def score_current_trace(self, **kwargs):
-            pass
-
-    langfuse_context = _FakeLangfuseContext()
 
 # =============================================================================
 # Logging Configuration
@@ -169,39 +144,251 @@ MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 
 
 # =============================================================================
-# SkillLoader - The core addition in v4
+# NEW in v5: Permission System
+# =============================================================================
+
+class Permission(Enum):
+    """
+    Three-level permission model.
+
+    Why three levels instead of two?
+    - ALLOW: Safe operations (reading files, listing directories)
+    - ASK: Potentially dangerous but often needed (writing files, running scripts)
+    - DENY: Never allowed (system destruction, privilege escalation)
+
+    Binary allow/deny is too coarse. This matches how humans think about risk.
+    """
+    ALLOW = "allow"      # Execute without asking
+    ASK = "ask"          # Require user confirmation
+    DENY = "deny"        # Block completely
+
+
+@dataclass
+class PermissionRule:
+    """
+    A single permission rule with glob pattern matching.
+
+    Examples:
+        PermissionRule("ls *", Permission.ALLOW, "Listing is safe")
+        PermissionRule("rm -rf /*", Permission.DENY, "System destruction")
+        PermissionRule("npm *", Permission.ASK, "Package operations")
+    """
+    pattern: str         # Glob pattern (supports * and ?)
+    permission: Permission
+    reason: str          # Human-readable explanation
+
+
+class PermissionManager:
+    """
+    Layered permission management for tool operations.
+
+    Categories:
+    ----------
+    - read:   File reading operations (default: ALLOW)
+    - write:  File writing operations (default: ASK)
+    - exec:   Command execution (default: ASK for unknown)
+    - net:    Network operations (default: DENY)
+
+    Session Grants:
+    --------------
+    When user approves with "always", the grant is cached for the session.
+    This prevents repetitive confirmations for the same operation type.
+
+    Why glob patterns?
+    -----------------
+    Exact string matching is too rigid. "ls" vs "ls -la" vs "ls ." are all safe.
+    Glob patterns like "ls *" catch all variants with one rule.
+    """
+
+    def __init__(self, workdir: Path):
+        self.workdir = workdir
+        self.session_grants: dict[str, bool] = {}  # Cache for session approvals
+
+        # Default rules by category
+        # Rules are checked in order - first match wins
+        self.rules: dict[str, list[PermissionRule]] = {
+            "read": [
+                PermissionRule("*", Permission.ALLOW, "Reading is safe"),
+            ],
+            "write": [
+                # Safe writes
+                PermissionRule("*.md", Permission.ALLOW, "Documentation"),
+                PermissionRule("*.txt", Permission.ALLOW, "Text files"),
+                # Dangerous writes
+                PermissionRule("*.env*", Permission.ASK, "Environment files may contain secrets"),
+                PermissionRule("*credentials*", Permission.DENY, "Credential files"),
+                PermissionRule("*secret*", Permission.DENY, "Secret files"),
+                PermissionRule("*.pem", Permission.DENY, "Private keys"),
+                PermissionRule("*.key", Permission.DENY, "Private keys"),
+                # Default: ask
+                PermissionRule("*", Permission.ASK, "File modification"),
+            ],
+            "exec": [
+                # === ALWAYS ALLOW: Safe, read-only commands ===
+                PermissionRule("ls *", Permission.ALLOW, "Listing"),
+                PermissionRule("ls", Permission.ALLOW, "Listing"),
+                PermissionRule("pwd", Permission.ALLOW, "Current directory"),
+                PermissionRule("cat *", Permission.ALLOW, "Reading files"),
+                PermissionRule("head *", Permission.ALLOW, "Reading files"),
+                PermissionRule("tail *", Permission.ALLOW, "Reading files"),
+                PermissionRule("grep *", Permission.ALLOW, "Searching"),
+                PermissionRule("find *", Permission.ALLOW, "Finding files"),
+                PermissionRule("wc *", Permission.ALLOW, "Counting"),
+                PermissionRule("echo *", Permission.ALLOW, "Printing"),
+                PermissionRule("which *", Permission.ALLOW, "Finding commands"),
+                PermissionRule("type *", Permission.ALLOW, "Command info"),
+                PermissionRule("file *", Permission.ALLOW, "File type"),
+
+                # Git read operations
+                PermissionRule("git status*", Permission.ALLOW, "Git status"),
+                PermissionRule("git diff*", Permission.ALLOW, "Git diff"),
+                PermissionRule("git log*", Permission.ALLOW, "Git log"),
+                PermissionRule("git branch*", Permission.ALLOW, "Git branches"),
+                PermissionRule("git show*", Permission.ALLOW, "Git show"),
+                PermissionRule("git remote -v", Permission.ALLOW, "Git remotes"),
+
+                # === ALWAYS DENY: Dangerous commands ===
+                PermissionRule("rm -rf /*", Permission.DENY, "System destruction"),
+                PermissionRule("rm -rf /", Permission.DENY, "System destruction"),
+                PermissionRule("sudo *", Permission.DENY, "Privilege escalation"),
+                PermissionRule("su *", Permission.DENY, "User switching"),
+                PermissionRule("chmod 777 *", Permission.DENY, "Dangerous permissions"),
+                PermissionRule(":(){ :|:& };:", Permission.DENY, "Fork bomb"),
+                PermissionRule("> /dev/*", Permission.DENY, "Device manipulation"),
+                PermissionRule("mkfs*", Permission.DENY, "Filesystem destruction"),
+                PermissionRule("dd if=*of=/dev/*", Permission.DENY, "Device overwrite"),
+                PermissionRule("shutdown*", Permission.DENY, "System shutdown"),
+                PermissionRule("reboot*", Permission.DENY, "System reboot"),
+                PermissionRule("curl*|*bash*", Permission.DENY, "Remote code execution"),
+                PermissionRule("wget*|*bash*", Permission.DENY, "Remote code execution"),
+                PermissionRule("*| bash*", Permission.DENY, "Piped execution"),
+                PermissionRule("*| sh*", Permission.DENY, "Piped execution"),
+
+                # === DEFAULT: Ask for everything else ===
+                PermissionRule("*", Permission.ASK, "Unknown command"),
+            ],
+            "net": [
+                # Network is disabled by default
+                PermissionRule("curl *", Permission.ASK, "HTTP request"),
+                PermissionRule("wget *", Permission.ASK, "HTTP download"),
+                PermissionRule("*", Permission.DENY, "Network access"),
+            ],
+        }
+
+    def check(self, category: str, operation: str) -> tuple[Permission, str]:
+        """
+        Check permission for an operation.
+
+        Args:
+            category: One of "read", "write", "exec", "net"
+            operation: The specific operation (command, path, etc.)
+
+        Returns:
+            (Permission, reason) tuple
+        """
+        # First check session grants
+        cache_key = f"{category}:{self._normalize(operation)}"
+        if cache_key in self.session_grants:
+            return Permission.ALLOW, "Granted this session"
+
+        # Then check rules
+        for rule in self.rules.get(category, []):
+            if self._match(operation, rule.pattern):
+                return rule.permission, rule.reason
+
+        # Default to ASK if no rules match
+        return Permission.ASK, "No matching rule"
+
+    def grant_session(self, category: str, operation: str):
+        """
+        Grant permission for this session.
+
+        Called when user approves with "always".
+        Uses normalized operation to catch similar commands.
+        """
+        cache_key = f"{category}:{self._normalize(operation)}"
+        self.session_grants[cache_key] = True
+
+    def _normalize(self, operation: str) -> str:
+        """
+        Normalize operation for caching.
+
+        Examples:
+            "git add file1.py" -> "git add *"
+            "cat src/main.py" -> "cat *"
+
+        This allows "git add" approval to cover all "git add" operations.
+        """
+        # For commands, normalize arguments
+        parts = operation.split()
+        if len(parts) > 1:
+            # Keep command and first subcommand, wildcard the rest
+            if parts[0] == "git" and len(parts) > 2:
+                return f"{parts[0]} {parts[1]} *"
+            return f"{parts[0]} *"
+        return operation
+
+    def _match(self, operation: str, pattern: str) -> bool:
+        """
+        Match operation against glob pattern.
+
+        Uses fnmatch for glob-style matching:
+        - * matches everything
+        - ? matches single character
+        """
+        return fnmatch.fnmatch(operation, pattern)
+
+
+def ask_user_permission(operation: str, reason: str, category: str) -> tuple[bool, bool]:
+    """
+    Interactive permission prompt.
+
+    Returns:
+        (allowed, remember) tuple
+        - allowed: Whether to allow this operation
+        - remember: Whether to remember for session
+
+    Display format:
+        ┌─ Permission Required ──────────────────────┐
+        │ Category: exec                             │
+        │ Operation: npm install lodash              │
+        │ Reason: Package operations                 │
+        │                                            │
+        │ [y] Allow once                             │
+        │ [n] Deny                                   │
+        │ [a] Allow for this session                 │
+        └────────────────────────────────────────────┘
+    """
+    print(f"\n┌─ Permission Required {'─' * 30}┐")
+    print(f"│ Category: {category}")
+    print(f"│ Operation: {operation[:50]}")
+    print(f"│ Reason: {reason}")
+    print(f"│")
+    print(f"│ [y] Allow once")
+    print(f"│ [n] Deny")
+    print(f"│ [a] Allow for this session")
+
+    while True:
+        response = input("└─> ").strip().lower()
+        if response in ("y", "yes"):
+            return True, False
+        if response in ("n", "no"):
+            return False, False
+        if response in ("a", "always"):
+            return True, True
+        print("  Please enter y/n/a")
+
+
+# Global permission manager instance
+PERMISSIONS = PermissionManager(WORKDIR)
+
+
+# =============================================================================
+# SkillLoader (from v4)
 # =============================================================================
 
 class SkillLoader:
-    """
-    Loads and manages skills from SKILL.md files.
-
-    A skill is a FOLDER containing:
-    - SKILL.md (required): YAML frontmatter + markdown instructions
-    - scripts/ (optional): Helper scripts the model can run
-    - references/ (optional): Additional documentation
-    - assets/ (optional): Templates, files for output
-
-    SKILL.md Format:
-    ----------------
-        ---
-        name: pdf
-        description: Process PDF files. Use when reading, creating, or merging PDFs.
-        ---
-
-        # PDF Processing Skill
-
-        ## Reading PDFs
-
-        Use pdftotext for quick extraction:
-        ```bash
-        pdftotext input.pdf -
-        ```
-        ...
-
-    The YAML frontmatter provides metadata (name, description).
-    The markdown body provides detailed instructions.
-    """
+    """Loads and manages skills from SKILL.md files. See v4 for details."""
 
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
@@ -209,29 +396,18 @@ class SkillLoader:
         self.load_skills()
 
     def parse_skill_md(self, path: Path) -> dict:
-        """
-        Parse a SKILL.md file into metadata and body.
-
-        Returns dict with: name, description, body, path, dir
-        Returns None if file doesn't match format.
-        """
         content = path.read_text()
-
-        # Match YAML frontmatter between --- markers
         match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
         if not match:
             return None
 
         frontmatter, body = match.groups()
-
-        # Parse YAML-like frontmatter (simple key: value)
         metadata = {}
         for line in frontmatter.strip().split("\n"):
             if ":" in line:
                 key, value = line.split(":", 1)
                 metadata[key.strip()] = value.strip().strip("\"'")
 
-        # Require name and description
         if "name" not in metadata or "description" not in metadata:
             return None
 
@@ -244,12 +420,6 @@ class SkillLoader:
         }
 
     def load_skills(self):
-        """
-        Scan skills directory and load all valid SKILL.md files.
-
-        Only loads metadata at startup - body is loaded on-demand.
-        This keeps the initial context lean.
-        """
         if not self.skills_dir.exists():
             return
 
@@ -266,12 +436,6 @@ class SkillLoader:
                 self.skills[skill["name"]] = skill
 
     def get_descriptions(self) -> str:
-        """
-        Generate skill descriptions for system prompt.
-
-        This is Layer 1 - only name and description, ~100 tokens per skill.
-        Full content (Layer 2) is loaded only when Skill tool is called.
-        """
         if not self.skills:
             return "(no skills available)"
 
@@ -281,21 +445,12 @@ class SkillLoader:
         )
 
     def get_skill_content(self, name: str) -> str:
-        """
-        Get full skill content for injection.
-
-        This is Layer 2 - the complete SKILL.md body, plus any available
-        resources (Layer 3 hints).
-
-        Returns None if skill not found.
-        """
         if name not in self.skills:
             return None
 
         skill = self.skills[name]
         content = f"# Skill: {skill['name']}\n\n{skill['body']}"
 
-        # List available resources (Layer 3 hints)
         resources = []
         for folder, label in [
             ("scripts", "Scripts"),
@@ -315,11 +470,9 @@ class SkillLoader:
         return content
 
     def list_skills(self) -> list:
-        """Return list of available skill names."""
         return list(self.skills.keys())
 
 
-# Global skill loader instance
 SKILLS = SkillLoader(SKILLS_DIR)
 
 
@@ -347,7 +500,6 @@ AGENT_TYPES = {
 
 
 def get_agent_descriptions() -> str:
-    """Generate agent type descriptions for system prompt."""
     return "\n".join(
         f"- {name}: {cfg['description']}"
         for name, cfg in AGENT_TYPES.items()
@@ -408,7 +560,7 @@ TODO = TodoManager()
 
 
 # =============================================================================
-# System Prompt - Updated for v4
+# System Prompt - Updated for v5
 # =============================================================================
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
@@ -421,11 +573,17 @@ Loop: plan -> act with tools -> report.
 **Subagents available** (invoke with Task tool for focused subtasks):
 {get_agent_descriptions()}
 
+**Permission System (NEW in v5)**:
+Some operations require user permission. If a tool returns "Permission denied",
+the user has blocked that operation. Try an alternative approach or ask the user
+how they'd like to proceed.
+
 Rules:
 - Use Skill tool IMMEDIATELY when a task matches a skill description
 - Use Task tool for subtasks needing focused exploration or implementation
 - Use TodoWrite to track multi-step work
 - Prefer tools over prose. Act, don't just explain.
+- If permission denied, explain what you wanted to do and ask for guidance.
 - After finishing, summarize what changed."""
 
 
@@ -436,7 +594,7 @@ Rules:
 BASE_TOOLS = [
     {
         "name": "bash",
-        "description": "Run shell command.",
+        "description": "Run shell command. Some commands may require user permission.",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -457,7 +615,7 @@ BASE_TOOLS = [
     },
     {
         "name": "write_file",
-        "description": "Write to file.",
+        "description": "Write to file. May require user permission for non-documentation files.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -469,7 +627,7 @@ BASE_TOOLS = [
     },
     {
         "name": "edit_file",
-        "description": "Replace text in file.",
+        "description": "Replace text in file. May require user permission.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -507,7 +665,6 @@ BASE_TOOLS = [
     },
 ]
 
-# Task tool (from v3)
 TASK_TOOL = {
     "name": "Task",
     "description": f"Spawn a subagent for a focused subtask.\n\nAgent types:\n{get_agent_descriptions()}",
@@ -531,7 +688,6 @@ TASK_TOOL = {
     },
 }
 
-# NEW in v4: Skill tool
 SKILL_TOOL = {
     "name": "Skill",
     "description": f"""Load a skill to gain specialized knowledge for a task.
@@ -541,10 +697,7 @@ Available skills:
 
 When to use:
 - IMMEDIATELY when user task matches a skill description
-- Before attempting domain-specific work (PDF, MCP, etc.)
-
-The skill content will be injected into the conversation, giving you
-detailed instructions and access to resources.""",
+- Before attempting domain-specific work (PDF, MCP, etc.)""",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -569,7 +722,7 @@ def get_tools_for_agent(agent_type: str) -> list:
 
 
 # =============================================================================
-# Tool Implementations
+# Tool Implementations - WITH PERMISSION CHECKS
 # =============================================================================
 
 def safe_path(p: str) -> Path:
@@ -581,21 +734,48 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(cmd: str) -> str:
-    """Execute shell command."""
-    if any(d in cmd for d in ["rm -rf /", "sudo", "shutdown"]):
-        return "Error: Dangerous command"
+    """
+    Execute shell command WITH permission check.
+
+    This is the key change from v4:
+    1. Check permission BEFORE executing
+    2. If ASK, prompt user
+    3. If DENY, return error without executing
+    4. If ALLOW or approved, execute normally
+    """
+    # Check permission
+    permission, reason = PERMISSIONS.check("exec", cmd)
+
+    if permission == Permission.DENY:
+        return f"Permission denied: {reason}"
+
+    if permission == Permission.ASK:
+        allowed, remember = ask_user_permission(cmd, reason, "exec")
+        if not allowed:
+            return "Permission denied by user"
+        if remember:
+            PERMISSIONS.grant_session("exec", cmd)
+
+    # Execute command
     try:
         r = subprocess.run(
             cmd, shell=True, cwd=WORKDIR,
             capture_output=True, text=True, timeout=60
         )
         return (r.stdout + r.stderr).strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out (60s limit)"
     except Exception as e:
         return f"Error: {e}"
 
 
 def run_read(path: str, limit: int = None) -> str:
-    """Read file contents."""
+    """Read file contents (always allowed by default)."""
+    permission, reason = PERMISSIONS.check("read", path)
+
+    if permission == Permission.DENY:
+        return f"Permission denied: {reason}"
+
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit:
@@ -606,7 +786,23 @@ def run_read(path: str, limit: int = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
-    """Write content to file."""
+    """Write content to file WITH permission check."""
+    permission, reason = PERMISSIONS.check("write", path)
+
+    if permission == Permission.DENY:
+        return f"Permission denied: {reason}"
+
+    if permission == Permission.ASK:
+        allowed, remember = ask_user_permission(
+            f"write to {path} ({len(content)} bytes)",
+            reason,
+            "write"
+        )
+        if not allowed:
+            return "Permission denied by user"
+        if remember:
+            PERMISSIONS.grant_session("write", path)
+
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -617,7 +813,23 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in file."""
+    """Replace exact text in file WITH permission check."""
+    permission, reason = PERMISSIONS.check("write", path)
+
+    if permission == Permission.DENY:
+        return f"Permission denied: {reason}"
+
+    if permission == Permission.ASK:
+        allowed, remember = ask_user_permission(
+            f"edit {path}",
+            reason,
+            "write"
+        )
+        if not allowed:
+            return "Permission denied by user"
+        if remember:
+            PERMISSIONS.grant_session("write", path)
+
     try:
         fp = safe_path(path)
         text = fp.read_text()
@@ -630,7 +842,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_todo(items: list) -> str:
-    """Update the todo list."""
+    """Update the todo list (no permission needed)."""
     try:
         return TODO.update(items)
     except Exception as e:
@@ -638,28 +850,13 @@ def run_todo(items: list) -> str:
 
 
 def run_skill(skill_name: str) -> str:
-    """
-    Load a skill and inject it into the conversation.
-
-    This is the key mechanism:
-    1. Get skill content (SKILL.md body + resource hints)
-    2. Return it wrapped in <skill-loaded> tags
-    3. Model receives this as tool_result (user message)
-    4. Model now "knows" how to do the task
-
-    Why tool_result instead of system prompt?
-    - System prompt changes invalidate cache (20-50x cost increase)
-    - Tool results append to end (prefix unchanged, cache hit)
-
-    This is how production systems stay cost-efficient.
-    """
+    """Load a skill (no permission needed)."""
     content = SKILLS.get_skill_content(skill_name)
 
     if content is None:
         available = ", ".join(SKILLS.list_skills()) or "none"
         return f"Error: Unknown skill '{skill_name}'. Available: {available}"
 
-    # Wrap in tags so model knows it's skill content
     return f"""<skill-loaded name="{skill_name}">
 {content}
 </skill-loaded>
@@ -667,13 +864,8 @@ def run_skill(skill_name: str) -> str:
 Follow the instructions in the skill above to complete the user's task."""
 
 
-@observe(name="SubAgent")
 def run_task(description: str, prompt: str, agent_type: str) -> str:
-    """Execute a subagent task (from v3). See v3 for details."""
-    langfuse_context.update_current_observation(
-        metadata={"agent_type": agent_type, "description": description}
-    )
-
+    """Execute a subagent task. See v3 for details."""
     if agent_type not in AGENT_TYPES:
         return f"Error: Unknown agent type '{agent_type}'"
 
@@ -740,12 +932,8 @@ Complete the task and return a clear, concise summary."""
     return "(subagent returned no text)"
 
 
-@observe(name="ToolExecution")
 def execute_tool(name: str, args: dict) -> str:
     """Dispatch tool call to implementation."""
-    langfuse_context.update_current_observation(
-        metadata={"tool": name, "args": args}
-    )
     if name == "bash":
         return run_bash(args["command"])
     if name == "read_file":
@@ -767,14 +955,8 @@ def execute_tool(name: str, args: dict) -> str:
 # Main Agent Loop
 # =============================================================================
 
-@observe(name="MainAgentLoop")
 def agent_loop(messages: list) -> list:
-    """
-    Main agent loop with skills support.
-
-    Same pattern as v3, but now with Skill tool.
-    When model loads a skill, it receives domain knowledge.
-    """
+    """Main agent loop with permission support."""
     while True:
         log_api_call("main_agent", SYSTEM, messages, ALL_TOOLS)
 
@@ -797,14 +979,10 @@ def agent_loop(messages: list) -> list:
 
         if response.stop_reason != "tool_use":
             messages.append({"role": "assistant", "content": response.content})
-            langfuse_context.score_current_trace(
-                name="completion", value=1, comment="Agent completed successfully"
-            )
             return messages
 
         results = []
         for tc in tool_calls:
-            # Special display for different tool types
             if tc.name == "Task":
                 print(f"\n> Task: {tc.input.get('description', 'subtask')}")
             elif tc.name == "Skill":
@@ -814,8 +992,10 @@ def agent_loop(messages: list) -> list:
 
             output = execute_tool(tc.name, tc.input)
 
-            # Skill tool shows summary, not full content
-            if tc.name == "Skill":
+            # Show permission denials prominently
+            if "Permission denied" in output:
+                print(f"  {output}")
+            elif tc.name == "Skill":
                 print(f"  Skill loaded ({len(output)} chars)")
             elif tc.name != "Task":
                 print(f"  {output}")
@@ -835,9 +1015,10 @@ def agent_loop(messages: list) -> list:
 # =============================================================================
 
 def main():
-    print(f"Mini Claude Code v4 (with Skills) - {WORKDIR}")
+    print(f"Mini Claude Code v5 (with Permission Sandbox) - {WORKDIR}")
     print(f"Skills: {', '.join(SKILLS.list_skills()) or 'none'}")
     print(f"Agent types: {', '.join(AGENT_TYPES.keys())}")
+    print("Permission system: ACTIVE (some operations require approval)")
     print("Type 'exit' to quit.\n")
 
     history = []
@@ -856,9 +1037,6 @@ def main():
         try:
             agent_loop(history)
         except Exception as e:
-            langfuse_context.score_current_trace(
-                name="completion", value=0, comment=str(e)
-            )
             print(f"Error: {e}")
 
         print()
