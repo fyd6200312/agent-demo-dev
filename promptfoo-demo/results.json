@@ -1,0 +1,339 @@
+{
+  "evalId": "eval-aGA-2026-02-07T13:52:00",
+  "results": {
+    "version": 3,
+    "timestamp": "2026-02-07T13:52:00.980Z",
+    "prompts": [
+      {
+        "id": "0f0c3bf8e456bba490bbb437e4cf57e47934a7df192fe87fb09fcfdcdcee32bf",
+        "raw": "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n",
+        "label": "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n",
+        "provider": "anthropic:messages:claude-sonnet-4-20250514",
+        "metrics": {
+          "score": 0,
+          "testPassCount": 0,
+          "testFailCount": 0,
+          "testErrorCount": 3,
+          "assertPassCount": 0,
+          "assertFailCount": 0,
+          "totalLatencyMs": 5874,
+          "tokenUsage": {
+            "prompt": 0,
+            "completion": 0,
+            "cached": 0,
+            "total": 0,
+            "numRequests": 3,
+            "completionDetails": {
+              "reasoning": 0,
+              "acceptedPrediction": 0,
+              "rejectedPrediction": 0
+            },
+            "assertions": {
+              "total": 0,
+              "prompt": 0,
+              "completion": 0,
+              "cached": 0,
+              "numRequests": 0,
+              "completionDetails": {
+                "reasoning": 0,
+                "acceptedPrediction": 0,
+                "rejectedPrediction": 0
+              }
+            }
+          },
+          "namedScores": {},
+          "namedScoresCount": {},
+          "cost": 0
+        }
+      }
+    ],
+    "results": [
+      {
+        "cost": 0,
+        "error": "API call error: 无效的令牌 (request id: 20260207135202935849530BR9MFR14), status 401, type new_api_error",
+        "gradingResult": null,
+        "id": "310481b0-82ea-4f43-b23f-987fb3b82545",
+        "latencyMs": 1962,
+        "namedScores": {},
+        "prompt": {
+          "raw": "你是一个编程助手。请回答用户的问题。\n\n用户问题: Python 中如何读取文件？\n",
+          "label": "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n",
+          "config": {}
+        },
+        "promptId": "0f0c3bf8e456bba490bbb437e4cf57e47934a7df192fe87fb09fcfdcdcee32bf",
+        "promptIdx": 0,
+        "provider": {
+          "id": "anthropic:messages:claude-sonnet-4-20250514",
+          "label": ""
+        },
+        "response": {
+          "error": "API call error: 无效的令牌 (request id: 20260207135202935849530BR9MFR14), status 401, type new_api_error"
+        },
+        "score": 0,
+        "success": false,
+        "testCase": {
+          "vars": {
+            "question": "Python 中如何读取文件？"
+          },
+          "assert": [
+            {
+              "type": "contains",
+              "value": "open"
+            },
+            {
+              "type": "contains",
+              "value": "read"
+            },
+            {
+              "type": "not-contains",
+              "value": "rm -rf"
+            }
+          ],
+          "options": {},
+          "metadata": {}
+        },
+        "testIdx": 0,
+        "vars": {
+          "question": "Python 中如何读取文件？"
+        },
+        "metadata": {
+          "_promptfooFileMetadata": {}
+        },
+        "failureReason": 2
+      },
+      {
+        "cost": 0,
+        "error": "API call error: 无效的令牌 (request id: 20260207135202935434889wsnJXMgE), status 401, type new_api_error",
+        "gradingResult": null,
+        "id": "6fcdf56e-0429-4695-ab15-e15eba039ec1",
+        "latencyMs": 1959,
+        "namedScores": {},
+        "prompt": {
+          "raw": "你是一个编程助手。请回答用户的问题。\n\n用户问题: 写一个查询所有用户的 SQL\n",
+          "label": "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n",
+          "config": {}
+        },
+        "promptId": "0f0c3bf8e456bba490bbb437e4cf57e47934a7df192fe87fb09fcfdcdcee32bf",
+        "promptIdx": 0,
+        "provider": {
+          "id": "anthropic:messages:claude-sonnet-4-20250514",
+          "label": ""
+        },
+        "response": {
+          "error": "API call error: 无效的令牌 (request id: 20260207135202935434889wsnJXMgE), status 401, type new_api_error"
+        },
+        "score": 0,
+        "success": false,
+        "testCase": {
+          "vars": {
+            "question": "写一个查询所有用户的 SQL"
+          },
+          "assert": [
+            {
+              "type": "contains",
+              "value": "SELECT"
+            },
+            {
+              "type": "contains-any",
+              "value": [
+                "FROM users",
+                "FROM user"
+              ]
+            },
+            {
+              "type": "regex",
+              "value": "SELECT.*FROM"
+            }
+          ],
+          "options": {},
+          "metadata": {}
+        },
+        "testIdx": 1,
+        "vars": {
+          "question": "写一个查询所有用户的 SQL"
+        },
+        "metadata": {
+          "_promptfooFileMetadata": {}
+        },
+        "failureReason": 2
+      },
+      {
+        "cost": 0,
+        "error": "API call error: 无效的令牌 (request id: 20260207135202931120665m7pzHYSW), status 401, type new_api_error",
+        "gradingResult": null,
+        "id": "69466e1b-f376-4c51-82fc-6c9b723be021",
+        "latencyMs": 1953,
+        "namedScores": {},
+        "prompt": {
+          "raw": "你是一个编程助手。请回答用户的问题。\n\n用户问题: 用 Python 写一个计算斐波那契数列的函数\n",
+          "label": "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n",
+          "config": {}
+        },
+        "promptId": "0f0c3bf8e456bba490bbb437e4cf57e47934a7df192fe87fb09fcfdcdcee32bf",
+        "promptIdx": 0,
+        "provider": {
+          "id": "anthropic:messages:claude-sonnet-4-20250514",
+          "label": ""
+        },
+        "response": {
+          "error": "API call error: 无效的令牌 (request id: 20260207135202931120665m7pzHYSW), status 401, type new_api_error"
+        },
+        "score": 0,
+        "success": false,
+        "testCase": {
+          "vars": {
+            "question": "用 Python 写一个计算斐波那契数列的函数"
+          },
+          "assert": [
+            {
+              "type": "contains",
+              "value": "def"
+            },
+            {
+              "type": "contains-any",
+              "value": [
+                "fibonacci",
+                "fib"
+              ]
+            },
+            {
+              "type": "javascript",
+              "value": "output.length > 50"
+            }
+          ],
+          "options": {},
+          "metadata": {}
+        },
+        "testIdx": 2,
+        "vars": {
+          "question": "用 Python 写一个计算斐波那契数列的函数"
+        },
+        "metadata": {
+          "_promptfooFileMetadata": {}
+        },
+        "failureReason": 2
+      }
+    ],
+    "stats": {
+      "successes": 0,
+      "failures": 0,
+      "errors": 3,
+      "tokenUsage": {
+        "prompt": 0,
+        "completion": 0,
+        "cached": 0,
+        "total": 0,
+        "numRequests": 3,
+        "completionDetails": {
+          "reasoning": 0,
+          "acceptedPrediction": 0,
+          "rejectedPrediction": 0
+        },
+        "assertions": {
+          "total": 0,
+          "prompt": 0,
+          "completion": 0,
+          "cached": 0,
+          "numRequests": 0,
+          "completionDetails": {
+            "reasoning": 0,
+            "acceptedPrediction": 0,
+            "rejectedPrediction": 0
+          }
+        }
+      },
+      "durationMs": 1968
+    }
+  },
+  "config": {
+    "description": "Agent 评测示例",
+    "prompts": [
+      "你是一个编程助手。请回答用户的问题。\n\n用户问题: {{question}}\n"
+    ],
+    "providers": [
+      {
+        "id": "anthropic:messages:claude-sonnet-4-20250514",
+        "config": {
+          "apiBaseUrl": "https://api5.ai",
+          "apiKey": "${ANTHROPIC_AUTH_TOKEN}"
+        }
+      }
+    ],
+    "tests": [
+      {
+        "vars": {
+          "question": "Python 中如何读取文件？"
+        },
+        "assert": [
+          {
+            "type": "contains",
+            "value": "open"
+          },
+          {
+            "type": "contains",
+            "value": "read"
+          },
+          {
+            "type": "not-contains",
+            "value": "rm -rf"
+          }
+        ]
+      },
+      {
+        "vars": {
+          "question": "写一个查询所有用户的 SQL"
+        },
+        "assert": [
+          {
+            "type": "contains",
+            "value": "SELECT"
+          },
+          {
+            "type": "contains-any",
+            "value": [
+              "FROM users",
+              "FROM user"
+            ]
+          },
+          {
+            "type": "regex",
+            "value": "SELECT.*FROM"
+          }
+        ]
+      },
+      {
+        "vars": {
+          "question": "用 Python 写一个计算斐波那契数列的函数"
+        },
+        "assert": [
+          {
+            "type": "contains",
+            "value": "def"
+          },
+          {
+            "type": "contains-any",
+            "value": [
+              "fibonacci",
+              "fib"
+            ]
+          },
+          {
+            "type": "javascript",
+            "value": "output.length > 50"
+          }
+        ]
+      }
+    ],
+    "outputPath": "./results.json",
+    "extensions": []
+  },
+  "shareableUrl": null,
+  "metadata": {
+    "promptfooVersion": "0.120.23",
+    "nodeVersion": "v24.10.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "exportedAt": "2026-02-07T13:52:02.980Z",
+    "evaluationCreatedAt": "2026-02-07T13:52:00.980Z"
+  }
+}

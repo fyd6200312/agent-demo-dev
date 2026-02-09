@@ -1,5 +1,5 @@
 """
-Unit tests for learn-claude-code agents.
+Unit tests for agent-demo-dev agents.
 
 These tests don't require API calls - they verify code structure and logic.
 """

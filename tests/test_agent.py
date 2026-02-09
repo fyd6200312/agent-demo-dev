@@ -1,5 +1,5 @@
 """
-Integration tests for learn-claude-code agents.
+Integration tests for agent-demo-dev agents.
 
 Comprehensive agent task tests covering v0-v4 core capabilities.
 Runs on GitHub Actions (Linux).

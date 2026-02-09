@@ -68,7 +68,7 @@
 ```bash
 # 克隆仓库
 git clone https://github.com/shareAI-lab/learn-claude-code
-cd learn-claude-code
+cd agent-demo-dev
 
 # 安装依赖
 pip install -r requirements.txt

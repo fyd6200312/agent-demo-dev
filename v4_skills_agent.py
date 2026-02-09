@@ -83,6 +83,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -97,12 +98,16 @@ load_dotenv(override=True)
 # When not configured, @observe becomes a no-op passthrough.
 
 try:
-    from langfuse.decorators import observe, langfuse_context
+    from langfuse import observe, get_client as _get_langfuse_client
     LANGFUSE_ENABLED = bool(
         os.getenv("LANGFUSE_SECRET_KEY") and os.getenv("LANGFUSE_PUBLIC_KEY")
     )
     if not LANGFUSE_ENABLED:
         raise ImportError("LangFuse keys not configured")
+
+    def _get_langfuse():
+        return _get_langfuse_client()
+
 except ImportError:
     LANGFUSE_ENABLED = False
 
@@ -112,15 +117,16 @@ except ImportError:
             return fn
         return decorator
 
-    class _FakeLangfuseContext:
-        def update_current_observation(self, **kwargs):
+    class _FakeLangfuse:
+        def update_current_span(self, **kwargs):
             pass
         def update_current_trace(self, **kwargs):
             pass
         def score_current_trace(self, **kwargs):
             pass
 
-    langfuse_context = _FakeLangfuseContext()
+    def _get_langfuse():
+        return _FakeLangfuse()
 
 # =============================================================================
 # Logging Configuration
@@ -321,6 +327,9 @@ class SkillLoader:
 
 # Global skill loader instance
 SKILLS = SkillLoader(SKILLS_DIR)
+
+# Session ID for grouping traces in Langfuse
+SESSION_ID = None
 
 
 # =============================================================================
@@ -670,7 +679,7 @@ Follow the instructions in the skill above to complete the user's task."""
 @observe(name="SubAgent")
 def run_task(description: str, prompt: str, agent_type: str) -> str:
     """Execute a subagent task (from v3). See v3 for details."""
-    langfuse_context.update_current_observation(
+    _get_langfuse().update_current_span(
         metadata={"agent_type": agent_type, "description": description}
     )
 
@@ -743,7 +752,7 @@ Complete the task and return a clear, concise summary."""
 @observe(name="ToolExecution")
 def execute_tool(name: str, args: dict) -> str:
     """Dispatch tool call to implementation."""
-    langfuse_context.update_current_observation(
+    _get_langfuse().update_current_span(
         metadata={"tool": name, "args": args}
     )
     if name == "bash":
@@ -775,6 +784,10 @@ def agent_loop(messages: list) -> list:
     Same pattern as v3, but now with Skill tool.
     When model loads a skill, it receives domain knowledge.
     """
+    # Set session_id to group all traces from same conversation
+    if SESSION_ID:
+        _get_langfuse().update_current_trace(session_id=SESSION_ID)
+
     while True:
         log_api_call("main_agent", SYSTEM, messages, ALL_TOOLS)
 
@@ -797,7 +810,7 @@ def agent_loop(messages: list) -> list:
 
         if response.stop_reason != "tool_use":
             messages.append({"role": "assistant", "content": response.content})
-            langfuse_context.score_current_trace(
+            _get_langfuse().score_current_trace(
                 name="completion", value=1, comment="Agent completed successfully"
             )
             return messages
@@ -835,7 +848,11 @@ def agent_loop(messages: list) -> list:
 # =============================================================================
 
 def main():
+    global SESSION_ID
+    SESSION_ID = str(uuid.uuid4())
+
     print(f"Mini Claude Code v4 (with Skills) - {WORKDIR}")
+    print(f"Session: {SESSION_ID[:8]}...")
     print(f"Skills: {', '.join(SKILLS.list_skills()) or 'none'}")
     print(f"Agent types: {', '.join(AGENT_TYPES.keys())}")
     print("Type 'exit' to quit.\n")
@@ -856,7 +873,7 @@ def main():
         try:
             agent_loop(history)
         except Exception as e:
-            langfuse_context.score_current_trace(
+            _get_langfuse().score_current_trace(
                 name="completion", value=0, comment=str(e)
             )
             print(f"Error: {e}")

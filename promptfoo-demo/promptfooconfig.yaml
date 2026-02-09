@@ -1,0 +1,76 @@
+# Promptfoo 评测配置示例
+# 运行: promptfoo eval
+
+description: "Agent 评测示例"
+
+# 配置模型提供商
+providers:
+  # 方式 1: 使用 OpenAI（如果有 key）
+  # - id: openai:gpt-4o-mini
+
+  # 方式 2: 使用你的 Anthropic 代理
+  - id: anthropic:messages:claude-sonnet-4-20250514
+    config:
+      apiBaseUrl: https://api5.ai
+      apiKey: ${ANTHROPIC_AUTH_TOKEN}
+
+# Prompt 模板
+prompts:
+  - |
+    你是一个编程助手。请回答用户的问题。
+
+    用户问题: {{question}}
+
+# 测试用例
+tests:
+  # 测试 1: 简单问答 + 规则断言
+  - vars:
+      question: "Python 中如何读取文件？"
+    assert:
+      # 规则断言：输出必须包含 open
+      - type: contains
+        value: "open"
+      # 规则断言：输出必须包含 read
+      - type: contains
+        value: "read"
+      # 规则断言：不能包含危险内容
+      - type: not-contains
+        value: "rm -rf"
+
+  # 测试 2: SQL 生成 + 规则断言
+  - vars:
+      question: "写一个查询所有用户的 SQL"
+    assert:
+      - type: contains
+        value: "SELECT"
+      - type: contains-any
+        value:
+          - "FROM users"
+          - "FROM user"
+      # 正则匹配
+      - type: regex
+        value: "SELECT.*FROM"
+
+  # 测试 3: 代码生成 + 规则断言
+  - vars:
+      question: "用 Python 写一个计算斐波那契数列的函数"
+    assert:
+      - type: contains
+        value: "def"
+      - type: contains-any
+        value:
+          - "fibonacci"
+          - "fib"
+      # 输出长度检查
+      - type: javascript
+        value: output.length > 50
+
+  # 测试 4: 语义断言（需要 LLM 打分，可选）
+  # - vars:
+  #     question: "解释什么是递归"
+  #   assert:
+  #     - type: llm-rubric
+  #       value: "回答是否清晰解释了递归的概念，包括基本情况和递归调用"
+
+# 输出格式
+outputPath: ./results.json

@@ -1,0 +1,62 @@
+# Promptfoo Agent 评测配置
+# 运行: promptfoo eval
+
+description: "v4_skills_agent 评测"
+
+# 使用自定义 Provider 调用你的 Agent
+providers:
+  - id: exec:python
+    config:
+      command: python3 agent_provider.py
+
+# Prompt 模板（直接传给 agent）
+prompts:
+  - "{{task}}"
+
+# 测试用例
+tests:
+  # 测试 1: 文件操作 - 检查是否调用了正确的工具
+  - vars:
+      task: "读取 README.md 文件的内容"
+    assert:
+      # 检查 metadata 中是否包含 read_file 工具调用
+      - type: javascript
+        value: |
+          const metadata = JSON.parse(output).metadata || {};
+          const toolCalls = metadata.tool_calls || [];
+          return toolCalls.some(tc => tc.name === 'read_file');
+
+  # 测试 2: Shell 命令 - 检查是否调用了 bash
+  - vars:
+      task: "列出当前目录的文件"
+    assert:
+      - type: javascript
+        value: |
+          const metadata = JSON.parse(output).metadata || {};
+          const toolCalls = metadata.tool_calls || [];
+          return toolCalls.some(tc => tc.name === 'bash');
+
+  # 测试 3: 简单问答 - 不需要工具
+  - vars:
+      task: "什么是 Python?"
+    assert:
+      # 输出应该包含 Python 相关内容
+      - type: contains-any
+        value:
+          - "Python"
+          - "编程"
+          - "programming"
+
+  # 测试 4: 路由正确性 - 复杂任务应该调用工具
+  - vars:
+      task: "帮我查看 v4_skills_agent.py 的前 10 行"
+    assert:
+      - type: javascript
+        value: |
+          const metadata = JSON.parse(output).metadata || {};
+          const toolCalls = metadata.tool_calls || [];
+          // 应该调用 read_file 或 bash
+          return toolCalls.length > 0;
+
+# 输出
+outputPath: ./agent_results.json
