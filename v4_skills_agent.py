@@ -84,6 +84,9 @@ import subprocess
 import sys
 import time
 import uuid
+import urllib.request
+import urllib.parse
+import urllib.error
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -172,6 +175,10 @@ SKILLS_DIR = WORKDIR / "skills"
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
+
+# Browser control server (moltbot)
+BROWSER_SERVER_URL = os.getenv("BROWSER_SERVER_URL", "http://127.0.0.1:18791")
+
 
 
 # =============================================================================
@@ -352,6 +359,12 @@ AGENT_TYPES = {
         "tools": ["bash", "read_file"],
         "prompt": "You are a planning agent. Analyze the codebase and output a numbered implementation plan. Do NOT make changes.",
     },
+    "general": {
+        "description": "General-purpose agent with full capabilities. Use when task doesn't fit other agent types",
+        "tools": "*",  # All base tools + Skill tool
+        "prompt": "You are a general-purpose agent with full capabilities. Handle the task comprehensively using all available tools. Return a clear summary when done.",
+        "include_skill": True,  # Flag to include Skill tool
+    },
 }
 
 
@@ -430,9 +443,14 @@ Loop: plan -> act with tools -> report.
 **Subagents available** (invoke with Task tool for focused subtasks):
 {get_agent_descriptions()}
 
+**Browser available** (invoke with browser tool for web automation):
+- browser: Control web browser (navigate, snapshot, click, type, screenshot, etc.)
+
 Rules:
 - Use Skill tool IMMEDIATELY when a task matches a skill description
 - Use Task tool for subtasks needing focused exploration or implementation
+- Use browser tool when user needs web browsing, data scraping, or UI automation
+- Use 'general' agent when task doesn't clearly fit explore/code/plan types
 - Use TodoWrite to track multi-step work
 - Prefer tools over prose. Act, don't just explain.
 - After finishing, summarize what changed."""
@@ -566,15 +584,142 @@ detailed instructions and access to resources.""",
     },
 }
 
-ALL_TOOLS = BASE_TOOLS + [TASK_TOOL, SKILL_TOOL]
+# Browser tool - controls moltbot's browser HTTP service
+BROWSER_TOOL = {
+    "name": "browser",
+    "description": (
+        "Control the browser via browser control server."
+        "\n\n"
+        "Actions: start, stop, navigate, snapshot, screenshot, act, tabs, open, close, focus, "
+        "console, cookies, cookies_set, cookies_clear, dialog, requests, response_body, errors, "
+        "download, wait_download, storage_local, storage_session."
+        "\n\n"
+        "Workflow:\n"
+        "- Basic: start -> navigate -> snapshot (get refs) -> act (use ref) -> snapshot (verify)\n"
+        "- Efficient: batch multiple act calls between snapshots to save tokens.\n"
+        "  Example: fill username -> fill password -> click login -> THEN snapshot (no snapshot in between).\n"
+        "\n"
+        "IMPORTANT - Snapshot rules (snapshot is expensive, minimize calls):\n"
+        "- DO snapshot after: navigate to new page, click that may trigger page change or popup, "
+        "when you need new element refs, to verify critical results (login, search, form submission).\n"
+        "- DO NOT snapshot between: consecutive fill/type on form fields, simple type/fill after "
+        "a recent snapshot, pressing Enter right after typing in a field you already have the ref for.\n"
+        "\n"
+        "Element targeting:\n"
+        "- Use ref (e.g. e12) from the most recent snapshot. Always pass targetId from the snapshot "
+        "response into subsequent actions to stay on the same tab.\n"
+        "- Use selector (CSS) or text (visible text) for elements without ARIA roles or when ref is unavailable.\n"
+        "- Avoid act:wait by default; use only when no reliable UI state exists.\n"
+        "\n"
+        "Verification and error recovery:\n"
+        "- After snapshot, check that field values match what you typed. If mismatch, use triple-click "
+        "to select all + type to overwrite, or use fill instead of type.\n"
+        "- If click produces no page change, try selector or evaluate(window.location.href) to debug.\n"
+        "- On HTTP 500 or server errors, wait 2 seconds and retry once before giving up.\n"
+        "\n"
+        "New tab handling (target=_blank):\n"
+        "- Many sites open links in new tabs. After clicking a link, if the URL in the next snapshot "
+        "hasn't changed, immediately call 'tabs' to check for newly opened tabs.\n"
+        "- If a new tab exists, use 'focus' to switch to it (pass its targetId), then snapshot.\n"
+        "- Always pass the correct targetId from the tab you want to interact with.\n"
+        "\n"
+        "Search box handling:\n"
+        "- Many sites show autocomplete/suggestion dropdowns when you type in a search box. "
+        "Pressing Enter may NOT submit the search — it may only interact with the dropdown.\n"
+        "- After typing in a search box, snapshot to check if a dropdown appeared. "
+        "If so, click the appropriate suggestion link to trigger the actual search/navigation.\n"
+        "- If no dropdown and Enter didn't navigate, try clicking a search button or "
+        "navigate directly to the search URL (e.g. site.com/search?q=keyword).\n"
+        "\n"
+        "CRITICAL - Behavior rules:\n"
+        "- On login failure, ask the user to confirm credentials immediately. Do NOT silently try alternative login methods on your own.\n"
+        "- Trust the user: if user says 'already done X', snapshot to verify current state instead of arguing from memory.\n"
+        "- On repeated failures with the same approach, try a different method or ask the user for guidance. Do not retry the same failing action more than twice.\n"
+        "- NEVER silently give up and produce a partial result. If you cannot complete the task "
+        "(e.g. cannot open a page, cannot click a link), explicitly tell the user what failed and why.\n"
+        "- When summarizing information gathered from web pages, you MUST list all visited URLs at the end of your summary under a 'Sources:' section formatted as markdown links.\n"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "stop", "navigate", "snapshot", "screenshot",
+                         "act", "tabs", "open", "close", "focus", "console",
+                         "cookies", "cookies_set", "cookies_clear",
+                         "dialog", "requests", "response_body", "errors",
+                         "download", "wait_download",
+                         "storage_local", "storage_session"],
+                "description": "Browser action to perform"
+            },
+            "targetUrl": {
+                "type": "string",
+                "description": "URL for navigate/open actions"
+            },
+            "targetId": {
+                "type": "string",
+                "description": "Tab target ID (from snapshot/tabs response)"
+            },
+            "snapshotFormat": {
+                "type": "string",
+                "enum": ["ai", "aria"],
+                "description": "Snapshot format (default: ai)"
+            },
+            "request": {
+                "type": "object",
+                "description": "Action-specific data. For act: {kind, ref/selector/text, ...}",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["click", "type", "press", "hover",
+                                 "select", "fill", "scroll", "scrollIntoView",
+                                 "evaluate", "wait", "close"]
+                    },
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"},
+                    "key": {"type": "string"},
+                    "submit": {"type": "boolean"},
+                    "doubleClick": {"type": "boolean"},
+                    "expression": {"type": "string"},
+                    "values": {"type": "array", "items": {"type": "string"}},
+                    "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                    "amount": {"type": "number"},
+                    "waitFor": {"type": "string", "enum": ["text", "textGone", "selector", "url", "loadState"]},
+                    "url": {"type": "string"},
+                    "state": {"type": "string"},
+                    "timeMs": {"type": "number"},
+                    "timeoutMs": {"type": "number"},
+                },
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+ALL_TOOLS = BASE_TOOLS + [TASK_TOOL, SKILL_TOOL, BROWSER_TOOL]
 
 
 def get_tools_for_agent(agent_type: str) -> list:
-    """Filter tools based on agent type."""
-    allowed = AGENT_TYPES.get(agent_type, {}).get("tools", "*")
+    """Filter tools based on agent type.
+
+    Note: Subagents never get Task tool to prevent infinite spawning.
+    The 'general' agent gets Skill tool for full capability without spawning.
+    """
+    config = AGENT_TYPES.get(agent_type, {})
+    allowed = config.get("tools", "*")
+    include_skill = config.get("include_skill", False)
+
     if allowed == "*":
-        return BASE_TOOLS
-    return [t for t in BASE_TOOLS if t["name"] in allowed]
+        tools = BASE_TOOLS.copy()
+    else:
+        tools = [t for t in BASE_TOOLS if t["name"] in allowed]
+
+    # Add Skill tool for agents that need it (e.g., general)
+    if include_skill:
+        tools = tools + [SKILL_TOOL]
+
+    return tools
 
 
 # =============================================================================
@@ -676,6 +821,174 @@ def run_skill(skill_name: str) -> str:
 Follow the instructions in the skill above to complete the user's task."""
 
 
+def _browser_request(method: str, path: str, params: dict = None, body: dict = None,
+                     timeout: float = 15.0) -> str:
+    """Send HTTP request to browser control server. Uses only stdlib."""
+    url = BROWSER_SERVER_URL + path
+    if params:
+        qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        if qs:
+            url += "?" + qs
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            try:
+                return json.dumps(json.loads(raw), ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                return raw
+    except urllib.error.URLError as e:
+        if "Connection refused" in str(e) or "urlopen error" in str(e):
+            return (
+                "Error: 浏览器服务未启动。请先启动 moltbot 浏览器服务 "
+                f"(确保 {BROWSER_SERVER_URL} 可访问)。"
+            )
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_browser(args: dict) -> str:
+    """Execute browser tool action via HTTP API."""
+    action = args.get("action", "")
+    target_url = args.get("targetUrl", "")
+    target_id = args.get("targetId", "")
+    snapshot_format = args.get("snapshotFormat", "ai")
+    req = args.get("request") or {}
+
+    qp = {}
+
+    if action == "start":
+        return _browser_request("POST", "/start", params=qp)
+
+    elif action == "stop":
+        return _browser_request("POST", "/stop", params=qp)
+
+    elif action == "navigate":
+        if not target_url:
+            return "Error: targetUrl is required for navigate"
+        body = {"url": target_url}
+        if target_id:
+            body["targetId"] = target_id
+        return _browser_request("POST", "/navigate", params=qp, body=body)
+
+    elif action == "snapshot":
+        qp["format"] = snapshot_format
+        if target_id:
+            qp["targetId"] = target_id
+        return _browser_request("GET", "/snapshot", params=qp)
+
+    elif action == "screenshot":
+        body = {}
+        if target_id:
+            body["targetId"] = target_id
+        return _browser_request("POST", "/screenshot", params=qp, body=body)
+
+    elif action == "act":
+        if not req or not isinstance(req, dict):
+            return "Error: request object is required for act (e.g. {kind: 'click', ref: 'e12'})"
+        if target_id:
+            req["targetId"] = target_id
+        return _browser_request("POST", "/act", params=qp, body=req, timeout=35.0)
+
+    elif action == "tabs":
+        return _browser_request("GET", "/tabs", params=qp)
+
+    elif action == "open":
+        if not target_url:
+            return "Error: targetUrl is required for open"
+        return _browser_request("POST", "/tabs/open", params=qp, body={"url": target_url})
+
+    elif action == "focus":
+        if not target_id:
+            return "Error: targetId is required for focus"
+        return _browser_request("POST", "/tabs/focus", params=qp, body={"targetId": target_id})
+
+    elif action == "close":
+        if target_id:
+            return _browser_request("DELETE", f"/tabs/{urllib.parse.quote(target_id)}", params=qp)
+        return _browser_request("POST", "/act", params=qp, body={"kind": "close"})
+
+    elif action == "console":
+        return _browser_request("GET", "/console", params=qp)
+
+    elif action == "errors":
+        return _browser_request("GET", "/errors", params=qp)
+
+    elif action == "cookies":
+        return _browser_request("GET", "/cookies", params=qp)
+
+    elif action == "cookies_set":
+        if not req.get("cookies"):
+            return "Error: request.cookies array is required"
+        return _browser_request("POST", "/cookies/set", params=qp, body=req)
+
+    elif action == "cookies_clear":
+        return _browser_request("POST", "/cookies/clear", params=qp)
+
+    elif action == "dialog":
+        return _browser_request("POST", "/hooks/dialog", params=qp, body=req)
+
+    elif action == "requests":
+        rqp = dict(qp)
+        if req.get("url"):
+            rqp["url"] = req["url"]
+        if req.get("resourceType"):
+            rqp["resourceType"] = req["resourceType"]
+        if req.get("limit"):
+            rqp["limit"] = str(req["limit"])
+        return _browser_request("GET", "/requests", params=rqp)
+
+    elif action == "response_body":
+        if not req.get("url"):
+            return "Error: request.url is required for response_body"
+        body = {"url": req["url"]}
+        if target_id:
+            body["targetId"] = target_id
+        return _browser_request("POST", "/response/body", params=qp, body=body)
+
+    elif action == "download":
+        return _browser_request("GET", "/download", params=qp)
+
+    elif action == "wait_download":
+        if target_id:
+            req["targetId"] = target_id
+        return _browser_request("POST", "/wait/download", params=qp, body=req, timeout=35.0)
+
+    elif action == "storage_local":
+        if not req or req.get("action") is None:
+            sqp = dict(qp)
+            if req.get("key"):
+                sqp["key"] = req["key"]
+            if target_id:
+                sqp["targetId"] = target_id
+            return _browser_request("GET", "/storage/local", params=sqp)
+        else:
+            if target_id:
+                req["targetId"] = target_id
+            return _browser_request("POST", "/storage/local", params=qp, body=req)
+
+    elif action == "storage_session":
+        if not req or req.get("action") is None:
+            sqp = dict(qp)
+            if req.get("key"):
+                sqp["key"] = req["key"]
+            if target_id:
+                sqp["targetId"] = target_id
+            return _browser_request("GET", "/storage/session", params=sqp)
+        else:
+            if target_id:
+                req["targetId"] = target_id
+            return _browser_request("POST", "/storage/session", params=qp, body=req)
+
+    else:
+        return f"Error: Unknown browser action '{action}'"
+
+
 @observe(name="SubAgent")
 def run_task(description: str, prompt: str, agent_type: str) -> str:
     """Execute a subagent task (from v3). See v3 for details."""
@@ -769,6 +1082,8 @@ def execute_tool(name: str, args: dict) -> str:
         return run_task(args["description"], args["prompt"], args["agent_type"])
     if name == "Skill":
         return run_skill(args["skill"])
+    if name == "browser":
+        return run_browser(args)
     return f"Unknown tool: {name}"
 
 
@@ -822,6 +1137,12 @@ def agent_loop(messages: list) -> list:
                 print(f"\n> Task: {tc.input.get('description', 'subtask')}")
             elif tc.name == "Skill":
                 print(f"\n> Loading skill: {tc.input.get('skill', '?')}")
+            elif tc.name == "browser":
+                action = tc.input.get('action', '?')
+                detail = tc.input.get('targetUrl', '')
+                if not detail and isinstance(tc.input.get('request'), dict):
+                    detail = tc.input['request'].get('kind', '')
+                print(f"\n> Browser: {action}" + (f" ({detail})" if detail else ""))
             else:
                 print(f"\n> {tc.name}")
 
@@ -830,6 +1151,14 @@ def agent_loop(messages: list) -> list:
             # Skill tool shows summary, not full content
             if tc.name == "Skill":
                 print(f"  Skill loaded ({len(output)} chars)")
+            elif tc.name == "browser":
+                # Browser output can be large (snapshots), show truncated
+                lines = output.strip().split("\n")
+                if len(lines) > 10:
+                    print(f"  " + "\n  ".join(lines[:8]))
+                    print(f"  ... ({len(lines)} lines total)")
+                else:
+                    print(f"  {output}")
             elif tc.name != "Task":
                 print(f"  {output}")
 

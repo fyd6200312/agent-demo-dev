@@ -193,11 +193,10 @@ body {
   font-family:'JetBrains Mono','Fira Code',monospace;
   font-size:12px; line-height:1.5;
   white-space:pre-wrap; word-wrap:break-word; word-break:break-word;
-  min-height:32px; overflow-y:auto; overflow-x:hidden;
-  resize:vertical;
+  overflow-y:auto; overflow-x:hidden;
 }
-.tool-content.tool-input { max-height:150px; height:60px; }
-.tool-content.tool-output { max-height:400px; height:120px; }
+.tool-content.tool-input { max-height:100px; }
+.tool-content.tool-output { max-height:200px; }
 
 /* ===== Subagent ===== */
 .subagent-card {
@@ -229,9 +228,7 @@ body {
   background:var(--bg-tertiary); border-radius:4px;
   font-size:13px; line-height:1.5;
   max-height:200px; overflow-y:auto;
-  display:none;
 }
-.subagent-card.done .subagent-result { display:block; }
 
 /* ===== Input ===== */
 .input-area {
@@ -312,6 +309,23 @@ body {
   .msg { max-width:95%; }
   .tool-card,.subagent-card { max-width:95%; }
 }
+
+/* ===== Typing Indicator ===== */
+.typing-indicator {
+  display:flex; align-items:center; gap:4px;
+  padding:12px 16px; align-self:flex-start;
+}
+.typing-indicator span {
+  width:8px; height:8px; border-radius:50%;
+  background:var(--text-muted);
+  animation: typingBounce 1.2s infinite;
+}
+.typing-indicator span:nth-child(2) { animation-delay:0.2s; }
+.typing-indicator span:nth-child(3) { animation-delay:0.4s; }
+@keyframes typingBounce {
+  0%,60%,100% { transform:translateY(0); opacity:0.4; }
+  30% { transform:translateY(-6px); opacity:1; }
+}
 </style>
 </head>
 <body>
@@ -363,18 +377,20 @@ const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const todoList = document.getElementById('todoList');
 const skillsList = document.getElementById('skillsList');
-const welcome = document.getElementById('welcome');
+let welcome = document.getElementById('welcome');
 
 // ===== Marked config =====
 marked.setOptions({
-  highlight: (code, lang) => {
-    if (lang && hljs.getLanguage(lang)) {
-      return hljs.highlight(code, {language: lang}).value;
-    }
-    return hljs.highlightAuto(code).value;
-  },
   breaks: true,
 });
+
+function highlightCodeBlocks(container) {
+  const blocks = container.querySelectorAll('pre code');
+  if (blocks.length > 20) return;
+  blocks.forEach(el => {
+    if (el.textContent.length < 5000) hljs.highlightElement(el);
+  });
+}
 
 // ===== Init =====
 loadSkills();
@@ -394,12 +410,13 @@ async function send() {
   const text = input.value.trim();
   if (!text || processing) return;
 
-  if (welcome) welcome.remove();
+  if (welcome) { welcome.remove(); welcome = null; }
   input.value = '';
   input.style.height = 'auto';
 
   addMsg('user', text);
   setStatus(true);
+  showTypingIndicator();
 
   try {
     const res = await fetch('/api/chat', {
@@ -407,6 +424,7 @@ async function send() {
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({message: text}),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (data.error) {
       addMsg('error', data.error);
@@ -457,6 +475,7 @@ async function startSSE() {
 }
 
 function handleEvent(ev) {
+  removeTypingIndicator();
   switch(ev.type) {
     case 'message': addMsg('assistant', ev.content); break;
     case 'tool_call': addToolCall(ev.tool, ev.input); break;
@@ -480,7 +499,17 @@ function setStatus(active) {
   statusText.textContent = active ? 'Processing...' : 'Ready';
 }
 
+function isNearBottom() {
+  return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 150;
+}
+
 function scrollBottom() {
+  if (isNearBottom()) {
+    requestAnimationFrame(() => chat.scrollTop = chat.scrollHeight);
+  }
+}
+
+function forceScrollBottom() {
   requestAnimationFrame(() => chat.scrollTop = chat.scrollHeight);
 }
 
@@ -490,13 +519,36 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function truncateText(s, max) {
+  if (!s || s.length <= max) return s;
+  return s.slice(0, max) + '\n... (truncated, ' + s.length + ' chars total)';
+}
+
 function renderMd(text) {
   try { return marked.parse(text); }
   catch(e) { return escapeHtml(text); }
 }
 
+// ===== Typing Indicator =====
+function showTypingIndicator() {
+  removeTypingIndicator();
+  const el = document.createElement('div');
+  el.className = 'typing-indicator';
+  el.id = 'typingIndicator';
+  el.innerHTML = '<span></span><span></span><span></span>';
+  chat.appendChild(el);
+  forceScrollBottom();
+}
+
+function removeTypingIndicator() {
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
 // ===== Messages =====
 function addMsg(role, content) {
+  removeTypingIndicator();
+
   const div = document.createElement('div');
   div.className = `msg ${role}`;
 
@@ -508,7 +560,7 @@ function addMsg(role, content) {
   body.className = 'msg-body';
   if (role === 'assistant') {
     body.innerHTML = renderMd(content);
-    body.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+    highlightCodeBlocks(body);
   } else {
     body.textContent = content;
   }
@@ -516,16 +568,26 @@ function addMsg(role, content) {
   div.appendChild(label);
   div.appendChild(body);
   chat.appendChild(div);
-  scrollBottom();
+  if (role === 'user') forceScrollBottom();
+  else scrollBottom();
 }
 
 // ===== Tool Calls =====
 let toolCardCounter = 0;
+const toolDataStore = {}; // Store raw data, render only on expand
 
 function addToolCall(name, inp) {
   const id = 'tool-' + (++toolCardCounter);
+
+  // Store raw data
+  toolDataStore[id] = {
+    name: name,
+    input: truncateText(JSON.stringify(inp, null, 2), 500),
+    output: null, // filled later
+  };
+
   const card = document.createElement('div');
-  card.className = 'tool-card';
+  card.className = 'tool-card collapsed';
   card.id = id;
   card.dataset.tool = name;
 
@@ -539,26 +601,57 @@ function addToolCall(name, inp) {
   else if (name === 'Skill') summary = inp.skill || '';
   if (summary.length > 60) summary = summary.slice(0, 57) + '...';
 
+  // Only render header — body is empty until expanded
   card.innerHTML = `
-    <div class="tool-header" onclick="this.parentElement.classList.toggle('collapsed')">
+    <div class="tool-header">
       <span class="tool-icon">▶</span>
       <span class="tool-name">${escapeHtml(name)}</span>
       <span style="font-size:12px;color:var(--text-secondary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(summary)}</span>
       <span class="tool-status running">running</span>
     </div>
-    <div class="tool-body">
-      <div class="tool-section-label">Input</div>
-      <div class="tool-content tool-input">${escapeHtml(JSON.stringify(inp, null, 2))}</div>
-      <div class="tool-section-label">Output</div>
-      <div class="tool-content tool-output">⏳ 执行中...</div>
-    </div>
+    <div class="tool-body"></div>
   `;
+  card.querySelector('.tool-header').addEventListener('click', () => toggleToolCard(id));
   chat.appendChild(card);
   scrollBottom();
 }
 
+function toggleToolCard(id) {
+  const card = document.getElementById(id);
+  if (!card) return;
+  const isCollapsed = card.classList.contains('collapsed');
+  if (isCollapsed) {
+    // Expand: render body content from stored data
+    const data = toolDataStore[id];
+    if (data) {
+      const body = card.querySelector('.tool-body');
+      body.innerHTML = '';
+      const inputLabel = document.createElement('div');
+      inputLabel.className = 'tool-section-label';
+      inputLabel.textContent = 'Input';
+      const inputContent = document.createElement('div');
+      inputContent.className = 'tool-content tool-input';
+      inputContent.textContent = data.input;
+      const outputLabel = document.createElement('div');
+      outputLabel.className = 'tool-section-label';
+      outputLabel.textContent = 'Output';
+      const outputContent = document.createElement('div');
+      outputContent.className = 'tool-content tool-output';
+      outputContent.textContent = data.output || '⏳ 执行中...';
+      body.appendChild(inputLabel);
+      body.appendChild(inputContent);
+      body.appendChild(outputLabel);
+      body.appendChild(outputContent);
+    }
+    card.classList.remove('collapsed');
+  } else {
+    // Collapse: destroy body content to free DOM
+    card.querySelector('.tool-body').innerHTML = '';
+    card.classList.add('collapsed');
+  }
+}
+
 function updateToolResult(name, output) {
-  // Find the last tool card with matching name that is still running
   const cards = chat.querySelectorAll(`.tool-card[data-tool="${CSS.escape(name)}"]`);
   for (let i = cards.length - 1; i >= 0; i--) {
     const status = cards[i].querySelector('.tool-status');
@@ -566,44 +659,30 @@ function updateToolResult(name, output) {
       status.textContent = 'done';
       status.classList.remove('running');
       status.classList.add('done');
-      const out = cards[i].querySelector('.tool-output');
-      if (out) {
-        const display = output.length > 5000 ? output.slice(0, 5000) + '\n... (truncated)' : output;
-        // For bash/read_file, render as formatted pre block with line numbers
-        if (name === 'bash' || name === 'read_file') {
-          out.innerHTML = formatTerminalOutput(display);
-        } else {
-          out.textContent = display;
-        }
+      // Store truncated output in JS, NOT in DOM
+      const id = cards[i].id;
+      if (toolDataStore[id]) {
+        toolDataStore[id].output = truncateText(output, 1500);
       }
+      // Ensure collapsed (body is already empty)
+      cards[i].classList.add('collapsed');
+      cards[i].querySelector('.tool-body').innerHTML = '';
       break;
     }
   }
   scrollBottom();
 }
 
-function formatTerminalOutput(text) {
-  if (!text || text === '(no output)') return escapeHtml(text);
-  const lines = text.split('\n');
-  return lines.map(line => {
-    let escaped = escapeHtml(line);
-    // Highlight error lines
-    if (/^(error|Error|ERROR|fatal|FATAL|Traceback)/i.test(line)) {
-      return `<span style="color:var(--red)">${escaped}</span>`;
-    }
-    // Highlight warning lines
-    if (/^(warning|Warning|WARN)/i.test(line)) {
-      return `<span style="color:var(--orange)">${escaped}</span>`;
-    }
-    return escaped;
-  }).join('\n');
-}
+// formatTerminalOutput removed — all tool output uses plain textContent now
 
 // ===== Subagents =====
 let subagentCounter = 0;
+const subagentDataStore = {};
 
 function addSubagent(agentType, desc, skills) {
   const id = 'sub-' + (++subagentCounter);
+  subagentDataStore[id] = { result: null };
+
   const card = document.createElement('div');
   card.className = 'subagent-card';
   card.id = id;
@@ -620,7 +699,6 @@ function addSubagent(agentType, desc, skills) {
       ${skillTags}
     </div>
     <div class="subagent-progress">启动中...</div>
-    <div class="subagent-result"></div>
   `;
   chat.appendChild(card);
   scrollBottom();
@@ -644,11 +722,34 @@ function completeSubagent(desc, result) {
       cards[i].classList.add('done');
       cards[i].querySelector('.subagent-progress').innerHTML =
         '<span style="color:var(--green)">✓ 完成</span>';
-      const resDiv = cards[i].querySelector('.subagent-result');
-      if (result) {
-        resDiv.innerHTML = renderMd(result);
-        resDiv.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+      // Store result in JS, render a summary only
+      const id = cards[i].id;
+      const truncated = truncateText(result, 2000);
+      if (subagentDataStore[id]) {
+        subagentDataStore[id].result = truncated;
       }
+      // Show a clickable summary instead of full content
+      const resDiv = document.createElement('div');
+      resDiv.className = 'subagent-result-toggle';
+      resDiv.textContent = '点击查看结果 ▸';
+      resDiv.style.cssText = 'font-size:12px;color:var(--purple);cursor:pointer;margin-top:6px;';
+      const resultContainer = document.createElement('div');
+      resultContainer.className = 'subagent-result';
+      resultContainer.style.display = 'none';
+      resDiv.addEventListener('click', () => {
+        if (resultContainer.style.display === 'none') {
+          resultContainer.style.display = 'block';
+          resultContainer.innerHTML = renderMd(subagentDataStore[id]?.result || '');
+          highlightCodeBlocks(resultContainer);
+          resDiv.textContent = '收起结果 ▾';
+        } else {
+          resultContainer.style.display = 'none';
+          resultContainer.innerHTML = '';
+          resDiv.textContent = '点击查看结果 ▸';
+        }
+      });
+      cards[i].appendChild(resDiv);
+      cards[i].appendChild(resultContainer);
       break;
     }
   }
@@ -675,6 +776,7 @@ function renderTodos(todos) {
 async function loadSkills() {
   try {
     const res = await fetch('/api/skills');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (data.length === 0) {
       skillsList.innerHTML = '<div class="todo-empty">无可用 Skills</div>';
