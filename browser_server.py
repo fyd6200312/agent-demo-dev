@@ -80,6 +80,7 @@ _CONSENT_PATTERNS = [
 def _try_dismiss_popups(page):
     """Best-effort auto-dismiss cookie consent and overlay popups."""
     try:
+        # 1. Try ARIA button role matching
         for pattern in _CONSENT_PATTERNS:
             try:
                 btn = page.get_by_role("button", name=re.compile(pattern, re.IGNORECASE))
@@ -88,7 +89,8 @@ def _try_dismiss_popups(page):
                     return True
             except Exception:
                 continue
-        # Try common CSS selectors for consent overlays
+
+        # 2. Try common CSS selectors for consent overlays
         for selector in [
             "[class*='cookie'] button",
             "[class*='consent'] button",
@@ -98,6 +100,10 @@ def _try_dismiss_popups(page):
             "#onetrust-accept-btn-handler",
             ".cc-accept",
             ".cc-dismiss",
+            "[class*='modal'] button",
+            "[class*='overlay'] button",
+            "[class*='popup'] button",
+            "[class*='dialog'] button",
         ]:
             try:
                 el = page.locator(selector).first
@@ -106,6 +112,18 @@ def _try_dismiss_popups(page):
                     return True
             except Exception:
                 continue
+
+        # 3. Try clicking visible text directly (handles non-button elements
+        #    like <div>同意</div> or <span>Accept</span>)
+        for pattern in _CONSENT_PATTERNS:
+            try:
+                el = page.get_by_text(re.compile(f"^{re.escape(pattern)}$", re.IGNORECASE))
+                if el.count() > 0 and el.first.is_visible():
+                    el.first.click(timeout=2000)
+                    return True
+            except Exception:
+                continue
+
     except Exception:
         pass
     return False
@@ -263,8 +281,13 @@ def _unregister_page(target_id):
 # Snapshot: build AI-friendly page structure with element refs
 # ---------------------------------------------------------------------------
 
-def _build_snapshot(page):
-    """Build an AI-friendly snapshot with element refs."""
+def _build_snapshot(page, max_elements=0):
+    """Build an AI-friendly snapshot with element refs.
+
+    Args:
+        page: Playwright page object
+        max_elements: Max interactive elements to include (0 = unlimited)
+    """
     global _refs, _ref_target
 
     # Get accessibility tree via Playwright
@@ -303,6 +326,10 @@ def _build_snapshot(page):
         }
         if role in interactive_roles or (role == "generic" and name):
             ref_counter[0] += 1
+            # If max_elements is set and we've reached the limit, skip assigning ref
+            if max_elements and ref_counter[0] > max_elements:
+                ref_counter[0] -= 1
+                return
             ref_id = f"e{ref_counter[0]}"
             # Track nth index among same (role, name) elements for disambiguation
             key = (role, name)
@@ -592,13 +619,14 @@ def navigate():
 def snapshot():
     target_id = request.args.get("targetId")
     fmt = request.args.get("format", "ai")
+    max_elements = int(request.args.get("maxElements", 0))
 
     page, tid = _get_page(target_id)
     if not page:
         return jsonify({"error": "No page available. Start browser first."}), 400
 
     global _ref_target
-    text, refs = _build_snapshot(page)
+    text, refs = _build_snapshot(page, max_elements=max_elements)
     _ref_target = tid
 
     return jsonify({
@@ -642,11 +670,79 @@ def act():
 
     try:
         if kind == "click":
+            # Record state before click to detect navigation / new tabs
+            url_before = page.url
+            context = _state["context"]
+
             locator = _resolve_target(page, data)
-            if data.get("doubleClick"):
-                locator.dblclick(timeout=data.get("timeoutMs", 5000))
-            else:
-                locator.click(timeout=data.get("timeoutMs", 5000))
+
+            # Use expect_page to reliably detect new tabs opened by the click
+            new_page_obj = None
+            try:
+                with context.expect_page(timeout=3000) as new_page_info:
+                    if data.get("doubleClick"):
+                        locator.dblclick(timeout=data.get("timeoutMs", 5000))
+                    else:
+                        locator.click(timeout=data.get("timeoutMs", 5000))
+                new_page_obj = new_page_info.value
+            except Exception:
+                # No new page opened - that's fine, it may be same-page navigation
+                pass
+
+            # If expect_page didn't trigger (no new tab), do the click normally
+            if new_page_obj is None and not data.get("_clicked"):
+                try:
+                    # Click may have already happened inside expect_page even if it timed out
+                    pass
+                except Exception:
+                    pass
+
+            # Wait for current page load
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+
+            url_after = page.url
+
+            # Auto-dismiss popups if we navigated to a new page
+            if url_after != url_before:
+                page.wait_for_timeout(300)
+                _try_dismiss_popups(page)
+
+            # Build enriched response
+            result = {"ok": True, "kind": kind, "targetId": tid}
+            if url_after != url_before:
+                result["navigated"] = True
+                result["url"] = url_after
+                result["title"] = page.title()
+
+            if new_page_obj:
+                try:
+                    new_page_obj.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                # Find the targetId for this new page
+                new_tid = None
+                for t, p in _state["pages"].items():
+                    if p is new_page_obj:
+                        new_tid = t
+                        break
+                if not new_tid:
+                    # Register it if context.on("page") hasn't fired yet
+                    new_tid = _register_page(new_page_obj)
+                try:
+                    new_page_obj.wait_for_timeout(300)
+                    _try_dismiss_popups(new_page_obj)
+                except Exception:
+                    pass
+                result["newTabs"] = [{
+                    "targetId": new_tid,
+                    "url": new_page_obj.url,
+                    "title": new_page_obj.title(),
+                }]
+
+            return jsonify(result)
 
         elif kind == "type":
             locator = _resolve_target(page, data)
@@ -738,6 +834,29 @@ def act():
                 # Simple time-based wait
                 page.wait_for_timeout(time_ms)
 
+        elif kind == "text":
+            # Extract page text content for summarization / content reading
+            selector = data.get("selector")
+            max_length = data.get("maxLength", 50000)
+            if selector:
+                try:
+                    el = page.locator(selector).first
+                    text_content = el.inner_text(timeout=data.get("timeoutMs", 5000))
+                except Exception:
+                    text_content = page.evaluate("() => document.body.innerText")
+            else:
+                text_content = page.evaluate("() => document.body.innerText")
+            if len(text_content) > max_length:
+                text_content = text_content[:max_length] + f"\n...(truncated, total {len(text_content)} chars)"
+            return jsonify({
+                "ok": True,
+                "kind": kind,
+                "targetId": tid,
+                "text": text_content,
+                "url": page.url,
+                "title": page.title(),
+            })
+
         elif kind == "close":
             if tid:
                 try:
@@ -752,8 +871,383 @@ def act():
 
         return jsonify({"ok": True, "kind": kind, "targetId": tid})
 
+    except ValueError as e:
+        # Element not found, invalid ref, missing params
+        return jsonify({"error": str(e), "errorType": "invalid_target"}), 400
+    except TimeoutError as e:
+        # Playwright timeout - element not visible, not clickable, etc.
+        return jsonify({
+            "error": f"Timeout: {e}",
+            "errorType": "timeout",
+            "hint": "Element may be hidden, covered by an overlay, or not yet loaded. "
+                    "Try dismissing popups, scrolling to the element, or waiting for page load.",
+        }), 408
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        err_str = str(e)
+        # Detect common Playwright errors and give actionable hints
+        if "Target closed" in err_str or "target page" in err_str.lower():
+            return jsonify({
+                "error": err_str,
+                "errorType": "page_closed",
+                "hint": "The page or tab was closed. A click may have opened a new tab. "
+                        "Use 'tabs' action to check for new tabs.",
+            }), 410
+        if "navigation" in err_str.lower():
+            return jsonify({
+                "error": err_str,
+                "errorType": "navigation",
+                "hint": "A navigation occurred during the action. "
+                        "Use snapshot to check the current page state.",
+            }), 200
+        return jsonify({"error": err_str, "errorType": "unknown"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Login detection helper
+# ---------------------------------------------------------------------------
+
+_LOGIN_KEYWORDS = ["login", "signin", "sign-in", "sign_in", "sso", "auth",
+                   "登录", "登陆", "注册"]
+
+
+def _is_login_page(url: str = "", title: str = "") -> bool:
+    """Check if a URL or title indicates a login/auth page."""
+    text = (url + " " + title).lower()
+    return any(kw in text for kw in _LOGIN_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Batch endpoint - execute multiple steps in one request
+# ---------------------------------------------------------------------------
+
+@app.route("/batch", methods=["POST"])
+def batch():
+    """Execute a sequence of browser steps. Stops early on login detection or error.
+
+    Request body:
+        {"steps": [
+            {"action": "navigate", "url": "https://example.com"},
+            {"action": "snapshot", "maxElements": 30},
+            {"action": "act", "kind": "type", "ref": "e10", "text": "query", "submit": true},
+            {"action": "snapshot", "maxElements": 30}
+        ]}
+
+    Response:
+        {"results": [...], "stoppedAt": null|int, "stopReason": null|"login_required"|"error"}
+    """
+    data = request.get_json(silent=True) or {}
+    steps = data.get("steps", [])
+    if not steps:
+        return jsonify({"error": "steps array required"}), 400
+
+    results = []
+    stop_reason = None
+    stopped_at = None
+
+    for i, step in enumerate(steps):
+        action = step.get("action", "")
+        target_id = step.get("targetId") or None
+
+        try:
+            if action == "navigate":
+                url = step.get("url", "")
+                if not url:
+                    results.append({"error": "url required", "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+                page, tid = _get_page(target_id)
+                if not page:
+                    results.append({"error": "No page available", "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    results.append({"error": str(e), "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+                page.wait_for_timeout(500)
+                _try_dismiss_popups(page)
+                result = {
+                    "ok": True, "action": "navigate", "targetId": tid,
+                    "title": page.title(), "url": page.url,
+                }
+                # Login detection
+                if _is_login_page(page.url, page.title()):
+                    result["login_required"] = True
+                    results.append(result)
+                    stop_reason = "login_required"
+                    stopped_at = i
+                    break
+                results.append(result)
+
+            elif action == "snapshot":
+                fmt = step.get("format", "ai")
+                max_elements = int(step.get("maxElements", 0))
+                page, tid = _get_page(target_id)
+                if not page:
+                    results.append({"error": "No page available", "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+                global _ref_target
+                text, refs = _build_snapshot(page, max_elements=max_elements)
+                _ref_target = tid
+                results.append({
+                    "snapshot": text, "targetId": tid,
+                    "title": page.title(), "url": page.url,
+                    "format": fmt, "refs": list(refs.keys()),
+                })
+
+            elif action == "act":
+                kind = step.get("kind", "")
+                page, tid = _get_page(target_id)
+                if not page:
+                    results.append({"error": "No page available", "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+
+                # Delegate to the existing /act handler logic inline
+                act_result = _execute_act(page, tid, step)
+                results.append(act_result)
+
+                # Login detection on click results
+                if kind == "click":
+                    new_tabs = act_result.get("newTabs", [])
+                    for tab in new_tabs:
+                        if _is_login_page(tab.get("url", ""), tab.get("title", "")):
+                            act_result["login_required"] = True
+                            stop_reason = "login_required"
+                            stopped_at = i
+                            break
+                    if act_result.get("navigated"):
+                        if _is_login_page(act_result.get("url", ""), act_result.get("title", "")):
+                            act_result["login_required"] = True
+                            stop_reason = "login_required"
+                            stopped_at = i
+                    if stop_reason:
+                        break
+
+                # Check for errors
+                if "error" in act_result:
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+
+            elif action == "focus":
+                ftid = step.get("targetId", "")
+                if not ftid or ftid not in _state["pages"]:
+                    results.append({"error": "Invalid targetId", "step": i})
+                    stop_reason = "error"
+                    stopped_at = i
+                    break
+                fp = _state["pages"][ftid]
+                try:
+                    fp.bring_to_front()
+                except Exception:
+                    pass
+                _state["last_target"] = ftid
+                results.append({"ok": True, "action": "focus", "targetId": ftid})
+
+            elif action == "close":
+                ctid = step.get("targetId", "")
+                if ctid and ctid in _state["pages"]:
+                    try:
+                        _state["pages"][ctid].close()
+                    except Exception:
+                        pass
+                    _unregister_page(ctid)
+                results.append({"ok": True, "action": "close", "targetId": ctid})
+
+            else:
+                results.append({"error": f"Unsupported batch action: {action}", "step": i})
+                stop_reason = "error"
+                stopped_at = i
+                break
+
+        except Exception as e:
+            results.append({"error": str(e), "step": i})
+            stop_reason = "error"
+            stopped_at = i
+            break
+
+    return jsonify({
+        "results": results,
+        "stoppedAt": stopped_at,
+        "stopReason": stop_reason,
+    })
+
+
+def _execute_act(page, tid, data):
+    """Execute a single act operation. Returns result dict (not a Flask response)."""
+    kind = data.get("kind", "")
+
+    try:
+        if kind == "click":
+            url_before = page.url
+            context = _state["context"]
+            locator = _resolve_target(page, data)
+
+            new_page_obj = None
+            try:
+                with context.expect_page(timeout=3000) as new_page_info:
+                    if data.get("doubleClick"):
+                        locator.dblclick(timeout=data.get("timeoutMs", 5000))
+                    else:
+                        locator.click(timeout=data.get("timeoutMs", 5000))
+                new_page_obj = new_page_info.value
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+
+            url_after = page.url
+            if url_after != url_before:
+                page.wait_for_timeout(300)
+                _try_dismiss_popups(page)
+
+            result = {"ok": True, "kind": kind, "targetId": tid}
+            if url_after != url_before:
+                result["navigated"] = True
+                result["url"] = url_after
+                result["title"] = page.title()
+
+            if new_page_obj:
+                try:
+                    new_page_obj.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                new_tid = None
+                for t, p in _state["pages"].items():
+                    if p is new_page_obj:
+                        new_tid = t
+                        break
+                if not new_tid:
+                    new_tid = _register_page(new_page_obj)
+                try:
+                    new_page_obj.wait_for_timeout(300)
+                    _try_dismiss_popups(new_page_obj)
+                except Exception:
+                    pass
+                result["newTabs"] = [{
+                    "targetId": new_tid,
+                    "url": new_page_obj.url,
+                    "title": new_page_obj.title(),
+                }]
+            return result
+
+        elif kind == "type":
+            locator = _resolve_target(page, data)
+            text = data.get("text", "")
+            locator.click(timeout=data.get("timeoutMs", 5000))
+            locator.fill(text)
+            if data.get("submit"):
+                locator.press("Enter")
+            return {"ok": True, "kind": kind, "targetId": tid}
+
+        elif kind == "press":
+            key = data.get("key", "")
+            if not key:
+                return {"error": "key required for press"}
+            ref = data.get("ref")
+            if ref:
+                locator = _resolve_ref(page, ref)
+                locator.press(key)
+            else:
+                page.keyboard.press(key)
+            return {"ok": True, "kind": kind, "targetId": tid}
+
+        elif kind == "fill":
+            fields = data.get("fields", [])
+            for field in fields:
+                fref = field.get("ref")
+                fval = field.get("value", "")
+                if fref:
+                    loc = _resolve_ref(page, fref)
+                    loc.fill(fval)
+            return {"ok": True, "kind": kind, "targetId": tid}
+
+        elif kind == "scroll":
+            direction = data.get("direction", "down")
+            amount = data.get("amount", 500)
+            if direction == "down":
+                page.mouse.wheel(0, amount)
+            elif direction == "up":
+                page.mouse.wheel(0, -amount)
+            elif direction == "right":
+                page.mouse.wheel(amount, 0)
+            elif direction == "left":
+                page.mouse.wheel(-amount, 0)
+            return {"ok": True, "kind": kind, "targetId": tid}
+
+        elif kind == "evaluate":
+            expression = data.get("expression", "")
+            if not expression:
+                return {"error": "expression required for evaluate"}
+            result = page.evaluate(expression)
+            return {"ok": True, "kind": kind, "targetId": tid, "result": result}
+
+        elif kind == "text":
+            selector = data.get("selector")
+            max_length = data.get("maxLength", 50000)
+            if selector:
+                try:
+                    el = page.locator(selector).first
+                    text_content = el.inner_text(timeout=data.get("timeoutMs", 5000))
+                except Exception:
+                    text_content = page.evaluate("() => document.body.innerText")
+            else:
+                text_content = page.evaluate("() => document.body.innerText")
+            if len(text_content) > max_length:
+                text_content = text_content[:max_length] + f"\n...(truncated, total {len(text_content)} chars)"
+            return {
+                "ok": True, "kind": kind, "targetId": tid,
+                "text": text_content, "url": page.url, "title": page.title(),
+            }
+
+        elif kind == "wait":
+            time_ms = data.get("timeMs", 1000)
+            timeout_ms = data.get("timeoutMs", 30000)
+            wait_for = data.get("waitFor")
+            if wait_for == "text":
+                page.wait_for_function(
+                    f"() => document.body.innerText.includes({json.dumps(data.get('text', ''))})",
+                    timeout=timeout_ms)
+            elif wait_for == "textGone":
+                page.wait_for_function(
+                    f"() => !document.body.innerText.includes({json.dumps(data.get('text', ''))})",
+                    timeout=timeout_ms)
+            elif wait_for == "selector":
+                page.wait_for_selector(data.get("selector", ""), timeout=timeout_ms)
+            elif wait_for == "url":
+                page.wait_for_url(f"**{data.get('url', '')}**", timeout=timeout_ms)
+            elif wait_for == "loadState":
+                page.wait_for_load_state(data.get("state", "load"), timeout=timeout_ms)
+            else:
+                page.wait_for_timeout(time_ms)
+            return {"ok": True, "kind": kind, "targetId": tid}
+
+        else:
+            return {"error": f"Unknown act kind: {kind}"}
+
+    except ValueError as e:
+        return {"error": str(e), "errorType": "invalid_target"}
+    except TimeoutError as e:
+        return {"error": f"Timeout: {e}", "errorType": "timeout"}
+    except Exception as e:
+        err_str = str(e)
+        if "Target closed" in err_str or "target page" in err_str.lower():
+            return {"error": err_str, "errorType": "page_closed"}
+        if "navigation" in err_str.lower():
+            return {"error": err_str, "errorType": "navigation"}
+        return {"error": err_str, "errorType": "unknown"}
 
 
 @app.route("/console", methods=["GET"])
