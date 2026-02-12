@@ -435,25 +435,43 @@ TODO = TodoManager()
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
+# How you work
 Loop: plan -> act with tools -> report.
+- Prefer tools over prose. Act, don't just explain.
+- Use TodoWrite to track multi-step work.
+- After finishing, summarize what changed.
 
-**Skills available** (invoke with Skill tool when task matches):
+# Tools available
+
+**Skills** (invoke with Skill tool when task matches):
 {SKILLS.get_descriptions()}
 
-**Subagents available** (invoke with Task tool for focused subtasks):
+**Subagents** (invoke with Task tool for focused subtasks):
 {get_agent_descriptions()}
 
-**Browser available** (invoke with browser tool for web automation):
+**Browser** (invoke with browser tool for web automation):
 - browser: Control web browser (navigate, snapshot, click, type, screenshot, etc.)
 
-Rules:
-- Use Skill tool IMMEDIATELY when a task matches a skill description
-- Use Task tool for subtasks needing focused exploration or implementation
-- Use browser tool when user needs web browsing, data scraping, or UI automation
-- Use 'general' agent when task doesn't clearly fit explore/code/plan types
-- Use TodoWrite to track multi-step work
-- Prefer tools over prose. Act, don't just explain.
-- After finishing, summarize what changed."""
+# Using your tools
+- Use Skill tool IMMEDIATELY when a task matches a skill description.
+- Use Task tool for subtasks needing focused exploration or implementation.
+- Use browser tool when user needs web browsing, data scraping, or UI automation.
+- Use 'general' agent when task doesn't clearly fit explore/code/plan types.
+
+# When to STOP and ask the user
+Do NOT try to power through these situations. Stop and ask immediately:
+- A page redirects to login/SSO or shows a login form — ask for credentials.
+- A previous login attempt failed — ask the user to confirm credentials.
+- You've failed the same approach twice — try a different method or ask the user.
+- You need information only the user has (account details, preferences, choices).
+- An action is destructive or irreversible — confirm before proceeding.
+
+# Doing tasks
+- Read before you write. Understand existing code/content before modifying.
+- When blocked, do not brute-force. Consider alternative approaches or ask the user.
+- Do not silently give up. If you cannot complete a task, tell the user what failed and why.
+- Trust the user: if user says "already done X", verify current state instead of arguing.
+- When summarizing web content, list all visited URLs under a 'Sources:' section."""
 
 
 # =============================================================================
@@ -590,54 +608,53 @@ BROWSER_TOOL = {
     "description": (
         "Control the browser via browser control server."
         "\n\n"
-        "Actions: start, stop, navigate, snapshot, screenshot, act, tabs, open, close, focus, "
-        "console, cookies, cookies_set, cookies_clear, dialog, requests, response_body, errors, "
-        "download, wait_download, storage_local, storage_session."
+        "PREFER action='batch' to combine multiple steps into ONE tool call. "
+        "This saves round-trips and tokens. The server executes steps sequentially "
+        "and auto-stops on login detection or errors."
         "\n\n"
-        "Workflow:\n"
-        "- Basic: start -> navigate -> snapshot (get refs) -> act (use ref) -> snapshot (verify)\n"
-        "- Efficient: batch multiple act calls between snapshots to save tokens.\n"
-        "  Example: fill username -> fill password -> click login -> THEN snapshot (no snapshot in between).\n"
+        "Workflow (use batch for steps 2-4):\n"
+        "1. start (single call)\n"
+        "2. batch: [navigate, snapshot] -> read refs from result\n"
+        "3. batch: [act, act, ..., snapshot] -> verify result\n"
+        "4. Repeat step 3 as needed. stop when done.\n"
         "\n"
-        "IMPORTANT - Snapshot rules (snapshot is expensive, minimize calls):\n"
-        "- DO snapshot after: navigate to new page, click that may trigger page change or popup, "
-        "when you need new element refs, to verify critical results (login, search, form submission).\n"
-        "- DO NOT snapshot between: consecutive fill/type on form fields, simple type/fill after "
-        "a recent snapshot, pressing Enter right after typing in a field you already have the ref for.\n"
+        "Batch examples:\n"
+        "- Search: [{navigate, url}, {snapshot, maxElements:30}, {act, kind:'type', ref:'e10', text:'query', submit:true}, {snapshot, maxElements:30}]\n"
+        "- Read article: [{navigate, url}, {act, kind:'text'}] — no snapshot needed\n"
+        "- Login: [{act, kind:'fill', fields:[{ref:'e1',value:'user'},{ref:'e2',value:'pass'}]}, {act, kind:'click', ref:'e3'}, {snapshot}]\n"
+        "- New tab: [{act, kind:'click', ref:'e5'}, {focus, targetId:'NEW_TAB_ID'}] — check click result for newTabs first\n"
+        "\n"
+        "Login detection (server-side, automatic):\n"
+        "- The server checks every navigate/click result for login keywords (login, sso, 登录, etc.)\n"
+        "- If detected: batch stops early, result includes stopReason='login_required'.\n"
+        "- When you see login_required: STOP and ask the user for credentials. Do NOT bypass.\n"
+        "\n"
+        "When NOT to use batch (use single action instead):\n"
+        "- start / stop\n"
+        "- When the next step depends on a previous result you haven't seen yet "
+        "(e.g. you need refs from a snapshot before you can click)\n"
+        "\n"
+        "Snapshot rules (minimize calls):\n"
+        "- DO snapshot: after navigate (to get refs), to verify critical results.\n"
+        "- DO NOT snapshot: to check if click worked (read navigated/newTabs instead), "
+        "between consecutive fill/type, when using act:text for content reading.\n"
+        "- Use maxElements 20-30 to limit refs and reduce tokens.\n"
         "\n"
         "Element targeting:\n"
-        "- Use ref (e.g. e12) from the most recent snapshot. Always pass targetId from the snapshot "
-        "response into subsequent actions to stay on the same tab.\n"
-        "- Use selector (CSS) or text (visible text) for elements without ARIA roles or when ref is unavailable.\n"
-        "- Avoid act:wait by default; use only when no reliable UI state exists.\n"
+        "- Use ref (e.g. e12) from the most recent snapshot.\n"
+        "- Use selector (CSS) or text (visible text) when ref is unavailable.\n"
         "\n"
-        "Verification and error recovery:\n"
-        "- After snapshot, check that field values match what you typed. If mismatch, use triple-click "
-        "to select all + type to overwrite, or use fill instead of type.\n"
-        "- If click produces no page change, try selector or evaluate(window.location.href) to debug.\n"
-        "- On HTTP 500 or server errors, wait 2 seconds and retry once before giving up.\n"
+        "Act kinds: click, type, fill, press, hover, select, scroll, scrollIntoView, evaluate, text, wait, close.\n"
+        "- click: {ref/selector/text} — response has navigated, url, title, newTabs.\n"
+        "- type: {ref/selector/text, text, submit?} — submit=true adds Enter.\n"
+        "- fill: {fields: [{ref, value}]} — fill multiple fields at once.\n"
+        "- text: {selector?, maxLength?} — extract page text. Preferred for reading content.\n"
+        "- scroll: {direction, amount?} — amount in pixels, default 500.\n"
         "\n"
-        "New tab handling (target=_blank):\n"
-        "- Many sites open links in new tabs. After clicking a link, if the URL in the next snapshot "
-        "hasn't changed, immediately call 'tabs' to check for newly opened tabs.\n"
-        "- If a new tab exists, use 'focus' to switch to it (pass its targetId), then snapshot.\n"
-        "- Always pass the correct targetId from the tab you want to interact with.\n"
-        "\n"
-        "Search box handling:\n"
-        "- Many sites show autocomplete/suggestion dropdowns when you type in a search box. "
-        "Pressing Enter may NOT submit the search — it may only interact with the dropdown.\n"
-        "- After typing in a search box, snapshot to check if a dropdown appeared. "
-        "If so, click the appropriate suggestion link to trigger the actual search/navigation.\n"
-        "- If no dropdown and Enter didn't navigate, try clicking a search button or "
-        "navigate directly to the search URL (e.g. site.com/search?q=keyword).\n"
-        "\n"
-        "CRITICAL - Behavior rules:\n"
-        "- On login failure, ask the user to confirm credentials immediately. Do NOT silently try alternative login methods on your own.\n"
-        "- Trust the user: if user says 'already done X', snapshot to verify current state instead of arguing from memory.\n"
-        "- On repeated failures with the same approach, try a different method or ask the user for guidance. Do not retry the same failing action more than twice.\n"
-        "- NEVER silently give up and produce a partial result. If you cannot complete the task "
-        "(e.g. cannot open a page, cannot click a link), explicitly tell the user what failed and why.\n"
-        "- When summarizing information gathered from web pages, you MUST list all visited URLs at the end of your summary under a 'Sources:' section formatted as markdown links.\n"
+        "Error handling:\n"
+        "- invalid_target: Bad ref. Run snapshot for fresh refs.\n"
+        "- timeout: Element hidden. Try scrolling or dismissing popups.\n"
+        "- page_closed: Tab closed. Check 'tabs' for new tabs.\n"
     ),
     "input_schema": {
         "type": "object",
@@ -645,12 +662,12 @@ BROWSER_TOOL = {
             "action": {
                 "type": "string",
                 "enum": ["start", "stop", "navigate", "snapshot", "screenshot",
-                         "act", "tabs", "open", "close", "focus", "console",
+                         "act", "batch", "tabs", "open", "close", "focus", "console",
                          "cookies", "cookies_set", "cookies_clear",
                          "dialog", "requests", "response_body", "errors",
                          "download", "wait_download",
                          "storage_local", "storage_session"],
-                "description": "Browser action to perform"
+                "description": "Browser action to perform. Use 'batch' to execute multiple steps in one call."
             },
             "targetUrl": {
                 "type": "string",
@@ -663,17 +680,29 @@ BROWSER_TOOL = {
             "snapshotFormat": {
                 "type": "string",
                 "enum": ["ai", "aria"],
-                "description": "Snapshot format (default: ai)"
+                "description": "Snapshot format: 'ai' (default, structured with refs) or 'aria' (raw tree)"
+            },
+            "maxElements": {
+                "type": "integer",
+                "description": "For snapshot: limit interactive elements returned (0=unlimited, default 0). Use 20-30 to reduce tokens."
             },
             "request": {
                 "type": "object",
-                "description": "Action-specific data. For act: {kind, ref/selector/text, ...}",
+                "description": "For act action. Required fields depend on kind:\n"
+                    "- click: ref or selector or text\n"
+                    "- type: (ref or selector or text) + text\n"
+                    "- press: key, optional ref\n"
+                    "- fill: fields [{ref, value}]\n"
+                    "- scroll: direction, optional amount\n"
+                    "- evaluate: expression\n"
+                    "- text: optional selector, optional maxLength\n"
+                    "- wait: optional timeMs, waitFor, text/selector/url/state",
                 "properties": {
                     "kind": {
                         "type": "string",
                         "enum": ["click", "type", "press", "hover",
                                  "select", "fill", "scroll", "scrollIntoView",
-                                 "evaluate", "wait", "close"]
+                                 "evaluate", "text", "wait", "close"]
                     },
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
@@ -690,6 +719,36 @@ BROWSER_TOOL = {
                     "state": {"type": "string"},
                     "timeMs": {"type": "number"},
                     "timeoutMs": {"type": "number"},
+                },
+            },
+            "steps": {
+                "type": "array",
+                "description": "For batch action. Array of steps to execute sequentially. "
+                    "Each step is an object with 'action' (navigate/snapshot/act/focus/close) "
+                    "and action-specific fields. Server auto-detects login pages and stops early. "
+                    "Example: [{\"action\":\"navigate\",\"url\":\"...\"}, {\"action\":\"snapshot\",\"maxElements\":30}, "
+                    "{\"action\":\"act\",\"kind\":\"type\",\"ref\":\"e10\",\"text\":\"query\",\"submit\":true}]",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["navigate", "snapshot", "act", "focus", "close"]},
+                        "url": {"type": "string"},
+                        "targetId": {"type": "string"},
+                        "maxElements": {"type": "integer"},
+                        "format": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "ref": {"type": "string"},
+                        "selector": {"type": "string"},
+                        "text": {"type": "string"},
+                        "key": {"type": "string"},
+                        "submit": {"type": "boolean"},
+                        "fields": {"type": "array"},
+                        "direction": {"type": "string"},
+                        "amount": {"type": "number"},
+                        "expression": {"type": "string"},
+                        "maxLength": {"type": "integer"},
+                    },
+                    "required": ["action"],
                 },
             },
         },
@@ -841,6 +900,14 @@ def _browser_request(method: str, path: str, params: dict = None, body: dict = N
                 return json.dumps(json.loads(raw), ensure_ascii=False, indent=2)
             except json.JSONDecodeError:
                 return raw
+    except urllib.error.HTTPError as e:
+        # Read the response body for detailed error info (errorType, hint, etc.)
+        try:
+            error_body = e.read().decode("utf-8")
+            error_data = json.loads(error_body)
+            return json.dumps(error_data, ensure_ascii=False, indent=2)
+        except Exception:
+            return f"Error: HTTP {e.code} - {e.reason}"
     except urllib.error.URLError as e:
         if "Connection refused" in str(e) or "urlopen error" in str(e):
             return (
@@ -868,6 +935,12 @@ def run_browser(args: dict) -> str:
     elif action == "stop":
         return _browser_request("POST", "/stop", params=qp)
 
+    elif action == "batch":
+        steps = args.get("steps", [])
+        if not steps:
+            return "Error: steps array is required for batch"
+        return _browser_request("POST", "/batch", body={"steps": steps}, timeout=120.0)
+
     elif action == "navigate":
         if not target_url:
             return "Error: targetUrl is required for navigate"
@@ -880,6 +953,9 @@ def run_browser(args: dict) -> str:
         qp["format"] = snapshot_format
         if target_id:
             qp["targetId"] = target_id
+        max_elements = args.get("maxElements")
+        if max_elements:
+            qp["maxElements"] = str(max_elements)
         return _browser_request("GET", "/snapshot", params=qp)
 
     elif action == "screenshot":
