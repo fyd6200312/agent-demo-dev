@@ -20,7 +20,7 @@ API:
     POST /navigate       - Navigate to URL
     GET  /snapshot       - Get page snapshot (AI format with element refs)
     POST /screenshot     - Take screenshot
-    POST /act            - Perform action (click/type/press/hover/scroll/scrollIntoView/evaluate/wait/close)
+    POST /act            - Perform action (click/type/press/hover/scroll/scrollIntoView/evaluate/wait/upload/close)
     GET  /console        - Get console messages
     GET  /errors         - Get console errors
     GET  /cookies        - Get cookies
@@ -29,6 +29,7 @@ API:
     POST /hooks/dialog   - Dialog handling (mode/accept/dismiss)
     GET  /requests       - Get captured network requests
     POST /response/body  - Get response body for a URL
+    POST /upload         - Upload files (file chooser or direct input)
     GET  /download       - List downloads
     POST /wait/download  - Wait for and capture a download
     GET  /storage/local  - Get localStorage
@@ -151,9 +152,20 @@ _state = {
     "headless": False,
 }
 
-# Ref mapping: snapshot generates refs like e1, e2, ... mapping to locators
-_refs = {}
-_ref_target = None  # which targetId the refs belong to
+# ---------------------------------------------------------------------------
+# Snapshot: ARIA role/ref constants
+# ---------------------------------------------------------------------------
+
+INTERACTIVE_ROLES = {
+    "link", "button", "textbox", "checkbox", "radio", "combobox",
+    "menuitem", "tab", "switch", "slider", "spinbutton", "searchbox",
+    "option", "menuitemcheckbox", "menuitemradio", "treeitem", "listbox",
+}
+
+CONTENT_ROLES = {
+    "heading", "cell", "gridcell", "columnheader", "rowheader",
+    "listitem", "article", "region", "main", "navigation",
+}
 
 
 def _resolve_system_chrome_path():
@@ -172,6 +184,20 @@ def _resolve_system_chrome_path():
 
 def _get_page(target_id=None):
     """Resolve a page by targetId, or return the last used / first available."""
+    if target_id and target_id in _state["pages"]:
+        _state["last_target"] = target_id
+        return _state["pages"][target_id]["page"], target_id
+    if _state["last_target"] and _state["last_target"] in _state["pages"]:
+        return _state["pages"][_state["last_target"]]["page"], _state["last_target"]
+    if _state["page_order"]:
+        tid = _state["page_order"][0]
+        _state["last_target"] = tid
+        return _state["pages"][tid]["page"], tid
+    return None, None
+
+
+def _get_page_entry(target_id=None):
+    """Resolve a page entry dict by targetId."""
     if target_id and target_id in _state["pages"]:
         _state["last_target"] = target_id
         return _state["pages"][target_id], target_id
@@ -194,7 +220,7 @@ def _make_target_id(page):
 def _register_page(page):
     """Register a page and set up console listener, dialog handler, stealth, etc."""
     tid = _make_target_id(page)
-    _state["pages"][tid] = page
+    _state["pages"][tid] = {"page": page, "refs": {}, "frame_selector": None}
     _state["page_order"].append(tid)
     _state["last_target"] = tid
 
@@ -281,111 +307,143 @@ def _unregister_page(target_id):
 # Snapshot: build AI-friendly page structure with element refs
 # ---------------------------------------------------------------------------
 
-def _build_snapshot(page, max_elements=0):
-    """Build an AI-friendly snapshot with element refs.
+_ARIA_LINE_RE = re.compile(r'^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$')
+
+
+def _build_snapshot(page, target_id=None, selector=None, frame=None, max_chars=0):
+    """Build an AI-friendly snapshot using Playwright's aria_snapshot().
 
     Args:
         page: Playwright page object
-        max_elements: Max interactive elements to include (0 = unlimited)
+        target_id: targetId for per-tab ref storage
+        selector: CSS selector to scope the snapshot (e.g. "main")
+        frame: CSS selector for iframe (e.g. "iframe#content")
+        max_chars: Truncate snapshot text if exceeds this (0 = unlimited)
+
+    Returns:
+        (snapshot_text, refs_dict)
     """
-    global _refs, _ref_target
-
-    # Get accessibility tree via Playwright
     try:
-        snapshot = page.accessibility.snapshot()
-    except Exception:
-        snapshot = None
+        # Build scoped locator
+        if frame:
+            scope = page.frame_locator(frame)
+            loc = scope.locator(selector) if selector else scope.locator(":root")
+        else:
+            loc = page.locator(selector) if selector else page.locator(":root")
 
-    if not snapshot:
-        # Fallback: use page content summary
+        raw = loc.aria_snapshot()
+    except Exception:
+        # Fallback
         title = page.title()
         url = page.url
-        return f"Page: {title}\nURL: {url}\n(accessibility snapshot unavailable)", {}
+        return f"Page: {title}\nURL: {url}\n(aria snapshot unavailable)", {}
 
+    if not raw or not raw.strip():
+        title = page.title()
+        url = page.url
+        return f"Page: {title}\nURL: {url}\n(empty page)", {}
+
+    # Parse aria_snapshot output and assign refs
+    lines = raw.split("\n")
     ref_counter = [0]
     refs = {}
-    seen_keys = {}  # (role, name) -> count, for nth disambiguation
-    lines = []
+    seen_keys = {}  # "role:name" -> count
+    out_lines = []
 
-    def walk(node, depth=0):
-        role = node.get("role", "")
-        name = node.get("name", "")
-        value = node.get("value", "")
-        children = node.get("children", [])
+    for line in lines:
+        m = _ARIA_LINE_RE.match(line)
+        if not m:
+            out_lines.append(line)
+            continue
 
-        # Skip generic/none roles without useful info
-        if role in ("none", "generic", "") and not name and not children:
-            return
+        prefix, role_raw, name, suffix = m.group(1), m.group(2), m.group(3), m.group(4)
+        role = role_raw.lower()
 
-        # Assign ref to interactive elements
-        ref_str = ""
-        interactive_roles = {
-            "link", "button", "textbox", "checkbox", "radio", "combobox",
-            "menuitem", "tab", "switch", "slider", "spinbutton", "searchbox",
-            "option", "menuitemcheckbox", "menuitemradio", "treeitem",
-        }
-        if role in interactive_roles or (role == "generic" and name):
+        # Determine if this element should get a ref
+        is_interactive = role in INTERACTIVE_ROLES
+        is_content = role in CONTENT_ROLES
+        should_have_ref = is_interactive or (is_content and name)
+
+        if should_have_ref:
             ref_counter[0] += 1
-            # If max_elements is set and we've reached the limit, skip assigning ref
-            if max_elements and ref_counter[0] > max_elements:
-                ref_counter[0] -= 1
-                return
             ref_id = f"e{ref_counter[0]}"
-            # Track nth index among same (role, name) elements for disambiguation
-            key = (role, name)
+
+            key = f"{role}:{name or ''}"
             nth = seen_keys.get(key, 0)
             seen_keys[key] = nth + 1
-            refs[ref_id] = {
-                "role": role,
-                "name": name,
-                "nth": nth,
-            }
-            ref_str = f"[{ref_id}] "
 
-        # Build display line
-        indent = "  " * depth
-        display_parts = []
-        if role and role not in ("none", "generic"):
-            display_parts.append(role)
-        if name:
-            display_parts.append(f'"{name}"')
-        if value:
-            display_parts.append(f'value="{value}"')
+            refs[ref_id] = {"role": role, "name": name or "", "nth": nth}
 
-        if display_parts:
-            line = f"{indent}{ref_str}{' '.join(display_parts)}"
-            lines.append(line)
+            # Rebuild line with ref tag
+            enhanced = f"{prefix}{role_raw}"
+            if name:
+                enhanced += f' "{name}"'
+            enhanced += f" [ref={ref_id}]"
+            if nth > 0:
+                enhanced += f" [nth={nth}]"
+            if suffix and suffix.strip():
+                enhanced += suffix
+            out_lines.append(enhanced)
+        else:
+            out_lines.append(line)
 
-        for child in children:
-            walk(child, depth + 1)
-
-    walk(snapshot)
+    # Remove nth from non-duplicate refs
+    dup_keys = {k for k, v in seen_keys.items() if v > 1}
+    for ref_id, info in refs.items():
+        key = f"{info['role']}:{info['name']}"
+        if key not in dup_keys:
+            info.pop("nth", None)
 
     title = page.title()
     url = page.url
     header = f"Page: {title}\nURL: {url}\n---\n"
-    body = "\n".join(lines) if lines else "(empty page)"
+    body = "\n".join(out_lines) if out_lines else "(empty page)"
+    snapshot_text = header + body
 
-    _refs = refs
-    return header + body, refs
+    if max_chars and len(snapshot_text) > max_chars:
+        snapshot_text = snapshot_text[:max_chars] + "\n\n[...TRUNCATED - page too large]"
+
+    # Store refs in per-target entry
+    if target_id and target_id in _state["pages"]:
+        _state["pages"][target_id]["refs"] = refs
+        _state["pages"][target_id]["frame_selector"] = frame or None
+
+    return snapshot_text, refs
 
 
-def _resolve_ref(page, ref_id):
-    """Resolve a ref ID to a Playwright locator."""
-    if ref_id not in _refs:
+def _resolve_ref(page, ref_id, target_id=None):
+    """Resolve a ref ID to a Playwright locator using per-target refs."""
+    refs = {}
+    frame_selector = None
+
+    if target_id and target_id in _state["pages"]:
+        entry = _state["pages"][target_id]
+        refs = entry.get("refs", {})
+        frame_selector = entry.get("frame_selector")
+
+    if ref_id not in refs:
         raise ValueError(f"Unknown ref '{ref_id}'. Run snapshot first to get current refs.")
-    info = _refs[ref_id]
+
+    info = refs[ref_id]
     role = info["role"]
     name = info.get("name", "")
-    nth = info.get("nth", 0)
-    if name:
-        loc = page.get_by_role(role, name=name)
+    nth = info.get("nth")
+
+    # Scope to iframe if snapshot was taken inside one
+    if frame_selector:
+        scope = page.frame_locator(frame_selector)
     else:
-        loc = page.get_by_role(role)
-    return loc.nth(nth)
+        scope = page
+
+    if name:
+        loc = scope.get_by_role(role, name=name)
+    else:
+        loc = scope.get_by_role(role)
+
+    return loc.nth(nth) if nth is not None else loc
 
 
-def _resolve_target(page, data):
+def _resolve_target(page, data, target_id=None):
     """Resolve a click/interaction target from ref, selector, or text.
 
     Priority: ref > selector > text
@@ -396,7 +454,7 @@ def _resolve_target(page, data):
     text = data.get("text")
 
     if ref:
-        return _resolve_ref(page, ref)
+        return _resolve_ref(page, ref, target_id=target_id)
     elif selector:
         return page.locator(selector).first
     elif text:
@@ -528,9 +586,6 @@ def stop_browser():
             "downloads": [],
             "started": False,
         })
-        global _refs, _ref_target
-        _refs = {}
-        _ref_target = None
         return jsonify({"ok": True})
 
 
@@ -538,8 +593,9 @@ def stop_browser():
 def list_tabs():
     tabs = []
     for tid in _state["page_order"]:
-        page = _state["pages"].get(tid)
-        if page:
+        entry = _state["pages"].get(tid)
+        if entry:
+            page = entry["page"]
             try:
                 tabs.append({
                     "targetId": tid,
@@ -574,11 +630,11 @@ def open_tab():
 
 @app.route("/tabs/<target_id>", methods=["DELETE"])
 def close_tab(target_id):
-    page = _state["pages"].get(target_id)
-    if not page:
+    entry = _state["pages"].get(target_id)
+    if not entry:
         return jsonify({"error": "tab not found"}), 404
     try:
-        page.close()
+        entry["page"].close()
     except Exception:
         pass
     _unregister_page(target_id)
@@ -619,15 +675,17 @@ def navigate():
 def snapshot():
     target_id = request.args.get("targetId")
     fmt = request.args.get("format", "ai")
-    max_elements = int(request.args.get("maxElements", 0))
+    selector = request.args.get("selector")
+    frame = request.args.get("frame")
+    max_chars = int(request.args.get("maxChars", 0))
 
     page, tid = _get_page(target_id)
     if not page:
         return jsonify({"error": "No page available. Start browser first."}), 400
 
-    global _ref_target
-    text, refs = _build_snapshot(page, max_elements=max_elements)
-    _ref_target = tid
+    text, refs = _build_snapshot(
+        page, target_id=tid, selector=selector, frame=frame, max_chars=max_chars,
+    )
 
     return jsonify({
         "snapshot": text,
@@ -674,9 +732,7 @@ def act():
             url_before = page.url
             context = _state["context"]
 
-            locator = _resolve_target(page, data)
-
-            # Use expect_page to reliably detect new tabs opened by the click
+            locator = _resolve_target(page, data, target_id=tid)
             new_page_obj = None
             try:
                 with context.expect_page(timeout=3000) as new_page_info:
@@ -725,7 +781,7 @@ def act():
                 # Find the targetId for this new page
                 new_tid = None
                 for t, p in _state["pages"].items():
-                    if p is new_page_obj:
+                    if p["page"] is new_page_obj:
                         new_tid = t
                         break
                 if not new_tid:
@@ -745,7 +801,7 @@ def act():
             return jsonify(result)
 
         elif kind == "type":
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
             text = data.get("text", "")
             locator.click(timeout=data.get("timeoutMs", 5000))
             locator.fill(text)
@@ -758,17 +814,17 @@ def act():
                 return jsonify({"error": "key required for press"}), 400
             ref = data.get("ref")
             if ref:
-                locator = _resolve_ref(page, ref)
+                locator = _resolve_ref(page, ref, target_id=tid)
                 locator.press(key)
             else:
                 page.keyboard.press(key)
 
         elif kind == "hover":
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
             locator.hover(timeout=data.get("timeoutMs", 5000))
 
         elif kind == "select":
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
             values = data.get("values", [])
             locator.select_option(values, timeout=data.get("timeoutMs", 5000))
 
@@ -778,7 +834,7 @@ def act():
                 fref = field.get("ref")
                 fval = field.get("value", "")
                 if fref:
-                    loc = _resolve_ref(page, fref)
+                    loc = _resolve_ref(page, fref, target_id=tid)
                     loc.fill(fval)
 
         elif kind == "scroll":
@@ -801,7 +857,7 @@ def act():
             return jsonify({"ok": True, "kind": kind, "targetId": tid, "result": result})
 
         elif kind == "scrollIntoView":
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
             locator.scroll_into_view_if_needed(timeout=data.get("timeoutMs", 5000))
 
         elif kind == "wait":
@@ -857,6 +913,22 @@ def act():
                 "title": page.title(),
             })
 
+        elif kind == "upload":
+            # Direct set_input_files on a file input element
+            paths = data.get("paths", [])
+            if not paths:
+                return jsonify({"error": "paths required for upload"}), 400
+            locator = _resolve_target(page, data, target_id=tid)
+            locator.set_input_files(paths)
+            # Trigger input/change events for compatibility
+            try:
+                locator.evaluate("""el => {
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }""")
+            except Exception:
+                pass
+
         elif kind == "close":
             if tid:
                 try:
@@ -900,6 +972,64 @@ def act():
                         "Use snapshot to check the current page state.",
             }), 200
         return jsonify({"error": err_str, "errorType": "unknown"}), 500
+
+
+# ---------------------------------------------------------------------------
+# File upload (file chooser mode)
+# ---------------------------------------------------------------------------
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """Upload files via file chooser or direct input.
+
+    Two modes:
+      1. inputRef mode: directly set files on an <input type="file"> element
+      2. ref mode: arm a file chooser listener, then click the trigger element
+
+    Request body:
+        paths: list of file paths to upload (required)
+        inputRef: ref of the <input type="file"> element (mode 1)
+        ref: ref of the button/element that triggers file chooser (mode 2)
+        targetId: tab to operate on
+    """
+    data = request.get_json(silent=True) or {}
+    target_id = data.get("targetId") or request.args.get("targetId")
+    paths = data.get("paths", [])
+    input_ref = data.get("inputRef")
+    ref = data.get("ref")
+
+    if not paths:
+        return jsonify({"error": "paths required"}), 400
+
+    page, tid = _get_page(target_id)
+    if not page:
+        return jsonify({"error": "No page available"}), 400
+
+    try:
+        if input_ref:
+            # Mode 1: direct set_input_files on file input
+            locator = _resolve_ref(page, input_ref, target_id=tid)
+            locator.set_input_files(paths)
+            try:
+                locator.evaluate("""el => {
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }""")
+            except Exception:
+                pass
+        elif ref:
+            # Mode 2: arm file chooser then click trigger
+            with page.expect_file_chooser(timeout=data.get("timeoutMs", 30000)) as fc_info:
+                locator = _resolve_ref(page, ref, target_id=tid)
+                locator.click(timeout=data.get("timeoutMs", 5000))
+            file_chooser = fc_info.value
+            file_chooser.set_files(paths)
+        else:
+            return jsonify({"error": "inputRef or ref required"}), 400
+
+        return jsonify({"ok": True, "targetId": tid, "files": len(paths)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -986,16 +1116,18 @@ def batch():
 
             elif action == "snapshot":
                 fmt = step.get("format", "ai")
-                max_elements = int(step.get("maxElements", 0))
+                selector = step.get("selector")
+                frame = step.get("frame")
+                max_chars = int(step.get("maxChars", 0))
                 page, tid = _get_page(target_id)
                 if not page:
                     results.append({"error": "No page available", "step": i})
                     stop_reason = "error"
                     stopped_at = i
                     break
-                global _ref_target
-                text, refs = _build_snapshot(page, max_elements=max_elements)
-                _ref_target = tid
+                text, refs = _build_snapshot(
+                    page, target_id=tid, selector=selector, frame=frame, max_chars=max_chars,
+                )
                 results.append({
                     "snapshot": text, "targetId": tid,
                     "title": page.title(), "url": page.url,
@@ -1045,7 +1177,7 @@ def batch():
                     stop_reason = "error"
                     stopped_at = i
                     break
-                fp = _state["pages"][ftid]
+                fp = _state["pages"][ftid]["page"]
                 try:
                     fp.bring_to_front()
                 except Exception:
@@ -1057,7 +1189,7 @@ def batch():
                 ctid = step.get("targetId", "")
                 if ctid and ctid in _state["pages"]:
                     try:
-                        _state["pages"][ctid].close()
+                        _state["pages"][ctid]["page"].close()
                     except Exception:
                         pass
                     _unregister_page(ctid)
@@ -1090,7 +1222,7 @@ def _execute_act(page, tid, data):
         if kind == "click":
             url_before = page.url
             context = _state["context"]
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
 
             new_page_obj = None
             try:
@@ -1126,7 +1258,7 @@ def _execute_act(page, tid, data):
                     pass
                 new_tid = None
                 for t, p in _state["pages"].items():
-                    if p is new_page_obj:
+                    if p["page"] is new_page_obj:
                         new_tid = t
                         break
                 if not new_tid:
@@ -1144,7 +1276,7 @@ def _execute_act(page, tid, data):
             return result
 
         elif kind == "type":
-            locator = _resolve_target(page, data)
+            locator = _resolve_target(page, data, target_id=tid)
             text = data.get("text", "")
             locator.click(timeout=data.get("timeoutMs", 5000))
             locator.fill(text)
@@ -1158,7 +1290,7 @@ def _execute_act(page, tid, data):
                 return {"error": "key required for press"}
             ref = data.get("ref")
             if ref:
-                locator = _resolve_ref(page, ref)
+                locator = _resolve_ref(page, ref, target_id=tid)
                 locator.press(key)
             else:
                 page.keyboard.press(key)
@@ -1170,7 +1302,7 @@ def _execute_act(page, tid, data):
                 fref = field.get("ref")
                 fval = field.get("value", "")
                 if fref:
-                    loc = _resolve_ref(page, fref)
+                    loc = _resolve_ref(page, fref, target_id=tid)
                     loc.fill(fval)
             return {"ok": True, "kind": kind, "targetId": tid}
 
@@ -1353,7 +1485,7 @@ def focus_tab():
     target_id = data.get("targetId")
     if not target_id or target_id not in _state["pages"]:
         return jsonify({"error": "Invalid targetId"}), 400
-    page = _state["pages"][target_id]
+    page = _state["pages"][target_id]["page"]
     try:
         page.bring_to_front()
     except Exception:
@@ -1447,7 +1579,7 @@ def wait_download():
             # If an action is provided, execute it to trigger the download
             action_kind = data.get("triggerAction")
             if action_kind == "click":
-                locator = _resolve_target(page, data)
+                locator = _resolve_target(page, data, target_id=tid)
                 locator.click(timeout=data.get("clickTimeoutMs", 5000))
         download = download_info.value
         path = download.path()
